@@ -8,7 +8,10 @@ the pointer twin for older arches, where Triton's descriptor emulation costs
 import torch
 import triton
 import triton.language as tl
-from triton.tools.tensor_descriptor import TensorDescriptor
+try:
+    from triton.tools.tensor_descriptor import TensorDescriptor
+except ModuleNotFoundError:
+    TensorDescriptor = None
 
 from ._preprocess import prepare
 
@@ -328,6 +331,8 @@ def sol_attn(
     if use_tma:
         q, k, v = q.contiguous(), k.contiguous(), v.contiguous()
         q, k, v, tokens, padded = _pad_to_blocks(q, k, v, BLOCK)
+        if TensorDescriptor is None:
+            raise RuntimeError("TensorDescriptor is unavailable for the TMA path.")
     else:
         # Pointer kernels mask ragged tails and take strides, so skip the
         # contiguous+pad copies (a multi-GB transient at video lengths).
