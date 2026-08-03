@@ -233,7 +233,7 @@ class SolAttnPatch(io.ComfyNode):
                                        "exact_kv_and_rows: also runs those query rows dense, making "
                                        "the generated audio stream exact (~20% cost). "
                                        "No effect on other models."),
-                io.Boolean.Input("morton", default=True,
+                io.Boolean.Input("morton", default=False,
                                  tooltip="Reorder video tokens into Morton (Z-order) so each "
                                          "64-token block is a compact 3D neighbourhood instead of a "
                                          "2-row strip, which makes routing far more accurate at a "
