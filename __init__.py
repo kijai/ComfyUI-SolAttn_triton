@@ -199,6 +199,71 @@ def make_override(tau=1.0, min_tokens=4096,
     return override
 
 
+def _compose_module_patch(module, patched_forward):
+    """Gate an object-patched attention forward (e.g. KJNodes' mem-efficient
+    Sage): calls Sol-Attn would take run the stock forward and reach the
+    override; the rest keeps the patch. Gate params come from
+    transformer_options["sol_compose"]; when absent the patch runs as-is.
+    """
+    stock = type(module).forward
+
+    def forward(*args, **kwargs):
+        options = kwargs.get("transformer_options")
+        if not isinstance(options, dict):
+            options = next((a for a in args if isinstance(a, dict) and "sol_compose" in a), {})
+        gate = options.get("sol_compose")
+        x = args[0] if args else None
+        take = gate is not None and torch.is_tensor(x) and x.device.type == "cuda" \
+            and x.dtype == torch.bfloat16 and x.ndim in (2, 3)
+        if take:
+            # H3 packs tokens first (s, dim); Wan/LTX2 are batch-first.
+            tokens = x.shape[0] if x.ndim == 2 else x.shape[1]
+            take = tokens >= gate["min_tokens"]
+        if take:
+            sigmas = options.get("sigmas")
+            if sigmas is not None:
+                sigma = float(sigmas[0])
+                take = not (sigma > gate["sigma_start"] or sigma < gate["sigma_end"])
+        if take:
+            return stock(module, *args, **kwargs)
+        return patched_forward(*args, **kwargs)
+
+    forward._sol_composed = True
+    return forward
+
+
+_COMPOSE_HOOKED = set()
+
+
+def _install_compose_hooks(model, attn_attr):
+    """Compose at sampling time, once all object patches are applied: a node
+    downstream of ours overwrites the same object-patch key, so execute-time
+    composition alone loses. The pre-hooks re-wrap any foreign attn forward
+    before each block runs; inert unless sol_compose is published.
+    """
+    if id(model) in _COMPOSE_HOOKED:
+        return
+
+    def pre_hook(block, args):
+        attn = getattr(block, attn_attr, None)
+        if attn is None:
+            return None
+        fwd = attn.__dict__.get("forward")
+        if fwd is None or getattr(fwd, "_sol_composed", False):
+            return None
+        if getattr(fwd, "__func__", None) is type(attn).forward:
+            return None  # unpatch leaves the stock forward as an instance attr
+        attn.forward = _compose_module_patch(attn, fwd)
+        _log_once(("composed", attn_attr),
+                  f"composing with a patched {attn_attr}.forward; Sol-Attn takes "
+                  "eligible self-attention calls, the patch keeps the rest")
+        return None
+
+    for block in model.blocks:
+        block.register_forward_pre_hook(pre_hook)
+    _COMPOSE_HOOKED.add(id(model))
+
+
 class SolAttnPatch(io.ComfyNode):
     @classmethod
     def define_schema(cls):
@@ -291,6 +356,33 @@ class SolAttnPatch(io.ComfyNode):
         if previous is not None:
             logging.info("[sol_attn] chaining onto an existing attention override; "
                          "Sol-Attn takes first refusal and delegates everything else to it")
+
+        # Forward-level patches bypass optimized_attention entirely, so there is
+        # nothing to chain onto -- gate each one instead (see _compose_module_patch).
+        composed = []
+        for key, patched in list(m.object_patches.items()):
+            if not key.endswith(".forward"):
+                continue
+            owner = key.rsplit(".", 2)[-2].lower()
+            if "attn" not in owner or "cross" in owner or owner == "attn2":
+                continue  # Sol-Attn never takes cross-attention; leave it patched
+            module = m.get_model_object(key[: -len(".forward")])
+            m.add_object_patch(key, _compose_module_patch(module, patched))
+            composed.append(key)
+        if composed:
+            logging.info(
+                f"[sol_attn] composed with {len(composed)} object-patched attention "
+                f"forward(s) (e.g. {composed[0]}): Sol-Attn takes eligible "
+                "self-attention calls, the existing patch keeps the rest")
+        # Downstream nodes overwrite the same keys; the hooks catch those at sampling time.
+        if is_h3:
+            _install_compose_hooks(diffusion_model, "attn")
+        elif is_wan:
+            _install_compose_hooks(diffusion_model, "self_attn")
+
+        m.model_options["transformer_options"]["sol_compose"] = {
+            "sigma_start": sigma_start, "sigma_end": sigma_end,
+            "min_tokens": min_tokens}
         m.model_options["transformer_options"]["optimized_attention_override"] = \
             make_override(tau=tau, min_tokens=min_tokens,
                           sigma_start=sigma_start, sigma_end=sigma_end,

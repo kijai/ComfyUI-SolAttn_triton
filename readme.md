@@ -9,3 +9,7 @@ ROCm 7.15 and Triton 3.7. The gfx1151 path uses tuned pointer kernels; TMA
 tensor descriptors remain NVIDIA-only. Triton compilation makes the first run slower.
 
 Balance the quality/speed with start/end percent and tau.
+
+Tests:
+
+https://github.com/user-attachments/assets/8d9ed820-0417-4d68-9d1c-5199534bed3b
