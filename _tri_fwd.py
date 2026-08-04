@@ -14,7 +14,12 @@ from ._preprocess import prepare
 
 
 def _has_tma(device):
-    return torch.cuda.get_device_capability(device)[0] >= 9
+    return torch.version.hip is None and torch.cuda.get_device_capability(device)[0] >= 9
+
+
+def _is_gfx1151(device):
+    arch = getattr(torch.cuda.get_device_properties(device), "gcnArchName", "")
+    return torch.version.hip is not None and arch.startswith("gfx1151")
 
 
 BLOCK = 64
@@ -162,17 +167,6 @@ def _forward(
     )
 
 
-@triton.autotune(
-    configs=[
-        # Kept small: every config costs seconds of compile per new T.
-        triton.Config({"BV": 128, "GROUP_SIZE": 64}, num_warps=4, num_stages=1),
-        triton.Config({"BV": 128, "GROUP_SIZE": 64}, num_warps=8, num_stages=1),
-        triton.Config({"BV": 128, "GROUP_SIZE": 64}, num_warps=4, num_stages=2),
-        triton.Config({"BV": 128, "GROUP_SIZE": 32}, num_warps=4, num_stages=1),
-        triton.Config({"BV": 64, "GROUP_SIZE": 64}, num_warps=4, num_stages=1),
-    ],
-    key=["T"],
-)
 @triton.jit
 def _forward_ptr(
     q_ptr, k_ptr, v_ptr, kc_ptr, vc_ptr, threshold, o_ptr,
@@ -309,6 +303,19 @@ def _forward_ptr(
     )
 
 
+_forward_ptr_autotuned = triton.autotune(
+    configs=[
+        # Kept small: every config costs seconds of compile per new T.
+        triton.Config({"BV": 128, "GROUP_SIZE": 64}, num_warps=4, num_stages=1),
+        triton.Config({"BV": 128, "GROUP_SIZE": 64}, num_warps=8, num_stages=1),
+        triton.Config({"BV": 128, "GROUP_SIZE": 64}, num_warps=4, num_stages=2),
+        triton.Config({"BV": 128, "GROUP_SIZE": 32}, num_warps=4, num_stages=1),
+        triton.Config({"BV": 64, "GROUP_SIZE": 64}, num_warps=4, num_stages=1),
+    ],
+    key=["T"],
+)(_forward_ptr)
+
+
 def sol_attn(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -340,8 +347,7 @@ def sol_attn(
     output = torch.empty((batch, padded, heads, head_dim),
                          device=v.device, dtype=v.dtype)
     if not use_tma:
-        grid = lambda META: (head_dim // META["BV"], blocks, batch * heads)
-        _forward_ptr[grid](
+        args = (
             q, k, v, kc, vc, threshold, output,
             scale,
             int(sink_blocks[0]),
@@ -354,11 +360,17 @@ def sol_attn(
             q.stride(0), q.stride(1), q.stride(2),
             k.stride(0), k.stride(1), k.stride(2),
             v.stride(0), v.stride(1), v.stride(2),
-            H=heads,
-            D=head_dim,
-            NT=blocks,
-            BLOCK_SIZE=BLOCK,
         )
+        meta = dict(H=heads, D=head_dim, NT=blocks, BLOCK_SIZE=BLOCK)
+        if _is_gfx1151(q.device):
+            _forward_ptr[(head_dim // 64, blocks, batch * heads)](
+                *args, **meta,
+                BV=64, GROUP_SIZE=16,
+                num_warps=4, num_stages=1, waves_per_eu=1,
+            )
+        else:
+            grid = lambda META: (head_dim // META["BV"], blocks, batch * heads)
+            _forward_ptr_autotuned[grid](*args, **meta)
         return output[:, :tokens]
     block_shape = [1, BLOCK, 1, head_dim]
     summary_shape = [1, GROUP, 1, head_dim]

@@ -12,7 +12,7 @@ import triton.language as tl
 from triton.tools.tensor_descriptor import TensorDescriptor
 
 from ._fused_prep import fused_preprocess
-from ._tri_fwd import _has_tma
+from ._tri_fwd import _has_tma, _is_gfx1151
 
 
 BLOCK = 64
@@ -155,17 +155,6 @@ def _forward_int8(
     )
 
 
-@triton.autotune(
-    configs=[
-        # Kept small: every config costs seconds of compile per new T.
-        triton.Config({"BV": 128, "GROUP_SIZE": 64}, num_warps=4, num_stages=1),
-        triton.Config({"BV": 128, "GROUP_SIZE": 64}, num_warps=8, num_stages=1),
-        triton.Config({"BV": 128, "GROUP_SIZE": 64}, num_warps=4, num_stages=2),
-        triton.Config({"BV": 128, "GROUP_SIZE": 32}, num_warps=4, num_stages=1),
-        triton.Config({"BV": 64, "GROUP_SIZE": 64}, num_warps=4, num_stages=1),
-    ],
-    key=["T"],
-)
 @triton.jit
 def _forward_int8_ptr(
     q_ptr, v_ptr, kc_ptr, vc_ptr, o_ptr,
@@ -307,6 +296,19 @@ def _forward_int8_ptr(
     )
 
 
+_forward_int8_ptr_autotuned = triton.autotune(
+    configs=[
+        # Kept small: every config costs seconds of compile per new T.
+        triton.Config({"BV": 128, "GROUP_SIZE": 64}, num_warps=4, num_stages=1),
+        triton.Config({"BV": 128, "GROUP_SIZE": 64}, num_warps=8, num_stages=1),
+        triton.Config({"BV": 128, "GROUP_SIZE": 64}, num_warps=4, num_stages=2),
+        triton.Config({"BV": 128, "GROUP_SIZE": 32}, num_warps=4, num_stages=1),
+        triton.Config({"BV": 64, "GROUP_SIZE": 64}, num_warps=4, num_stages=1),
+    ],
+    key=["T"],
+)(_forward_int8_ptr)
+
+
 def sol_attn_int8(q, k, v, *, scale=None, tau=1.0, sink_blocks=(0, 0), sink_q=(0, 0),
                   cornish_fisher=False):
     """Sol-Attn with an INT8 exact branch. Same contract as the BF16 kernel."""
@@ -331,8 +333,7 @@ def sol_attn_int8(q, k, v, *, scale=None, tau=1.0, sink_blocks=(0, 0), sink_q=(0
     output = torch.empty((batch, padded, heads, head_dim),
                          device=v.device, dtype=v.dtype)
     if not use_tma:
-        grid = lambda META: (head_dim // META["BV"], blocks, batch * heads)
-        _forward_int8_ptr[grid](
+        args = (
             q, v, kc, vc, output,
             qi, qs, ki, ks,
             threshold,
@@ -346,11 +347,17 @@ def sol_attn_int8(q, k, v, *, scale=None, tau=1.0, sink_blocks=(0, 0), sink_q=(0
             kc.shape[1],
             q.stride(0), q.stride(1), q.stride(2),
             v.stride(0), v.stride(1), v.stride(2),
-            H=heads,
-            D=head_dim,
-            NT=blocks,
-            BLOCK_SIZE=BLOCK,
         )
+        meta = dict(H=heads, D=head_dim, NT=blocks, BLOCK_SIZE=BLOCK)
+        if _is_gfx1151(q.device):
+            _forward_int8_ptr[(1, blocks, batch * heads)](
+                *args, **meta,
+                BV=128, GROUP_SIZE=32,
+                num_warps=4, num_stages=1,
+            )
+        else:
+            grid = lambda META: (head_dim // META["BV"], blocks, batch * heads)
+            _forward_int8_ptr_autotuned[grid](*args, **meta)
         return output[:, :tokens]
     block_shape = [1, BLOCK, 1, head_dim]
     summary_shape = [1, GROUP, 1, head_dim]
