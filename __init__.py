@@ -286,7 +286,7 @@ class SolAttnPatch(io.ComfyNode):
                         "only; everything else falls back to the existing attention backend.",
             inputs=[
                 io.Model.Input("model"),
-                io.Float.Input("tau", default=1.2, min=0.0, max=4.0, step=0.05,
+                io.Float.Input("tau", default=1.3, min=0.0, max=4.0, step=0.05,
                                tooltip="Threshold beta. Higher is sparser: 1.0 ~ 16% of "
                                        "blocks kept exact, 1.5 ~ 7%, 2.0 ~ 2.7%."),
                 io.Float.Input("start_percent", default=0.2, min=0.0, max=1.0, step=0.01,
@@ -294,13 +294,13 @@ class SolAttnPatch(io.ComfyNode):
                 io.Float.Input("end_percent", default=0.9, min=0.0, max=1.0, step=0.01),
                 io.Int.Input("min_tokens", default=4096, min=0, max=1 << 20, step=512,
                              tooltip="Sequences shorter than this stay dense."),
-                io.Boolean.Input("int8_qk", default=False,
+                io.Boolean.Input("int8_qk", default=True,
                                  tooltip="INT8 QK in the exact branch (Sage-style: smoothed K, "
                                          "per-token scales). Measured free in quality; helps at "
                                          "tau<=1.5, a net loss at tau>=2.0 where the quantize "
                                          "pass outweighs the shrinking exact branch."),
                 io.Combo.Input("sink_conditioning", options=["exact_kv", "exact_kv_and_rows", "off"],
-                               default="exact_kv",
+                               default="exact_kv_and_rows",
                                tooltip="MiniMax-H3 only. exact_kv: every query sees the packed "
                                        "text/audio/reference rows exactly (~3% cost). "
                                        "exact_kv_and_rows: also runs those query rows dense, making "
