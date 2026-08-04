@@ -18,6 +18,8 @@ from comfy.ldm.modules.attention import (
 )
 from comfy_api.latest import ComfyExtension, io
 
+from ._autotune_log import set_verbose as _set_autotune_verbose
+
 try:
     from ._tri_fwd import sol_attn as _sol_attn_kernel
     _IMPORT_ERROR = None
@@ -391,6 +393,7 @@ class SolAttnPatch(io.ComfyNode):
         if reorder:
             m.model_options["transformer_options"]["sol_morton"] = True
             m.model_options["transformer_options"]["sol_morton_curve"] = morton_curve
+        _set_autotune_verbose(verbose)
         reset_sol_attn_stats()
         return io.NodeOutput(m)
 

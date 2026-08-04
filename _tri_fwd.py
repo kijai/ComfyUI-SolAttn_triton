@@ -13,6 +13,7 @@ try:
 except ModuleNotFoundError:
     TensorDescriptor = None
 
+from ._autotune_log import wrap as _wrap_autotune
 from ._preprocess import prepare
 
 
@@ -310,6 +311,10 @@ def _forward_ptr(
         (output / row_sum[:, None]).to(tl.bfloat16),
         mask=q_rows_ok[:, None],
     )
+
+
+_wrap_autotune(_forward, "bf16 forward (descriptor)")
+_wrap_autotune(_forward_ptr, "bf16 forward (pointer)")
 
 
 def sol_attn(

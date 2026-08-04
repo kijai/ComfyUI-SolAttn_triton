@@ -6,6 +6,8 @@ import torch
 import triton
 import triton.language as tl
 
+from ._autotune_log import wrap as _wrap_autotune
+
 
 BLOCK_SIZE = 64
 # kc/vc are zero-padded to this many blocks so group tiles load unmasked;
@@ -171,6 +173,11 @@ def _diag_threshold_kernel(
         global_threshold + (batch * N + q_block) * H + head,
         mean + offset * std,
     )
+
+
+_wrap_autotune(_reduce_kc_kernel, "kc reduction")
+_wrap_autotune(_reduce_vc_kernel, "vc reduction")
+_wrap_autotune(_diag_threshold_kernel, "routing threshold")
 
 
 def _reduce_kv(

@@ -14,6 +14,7 @@ try:
 except ModuleNotFoundError:
     TensorDescriptor = None
 
+from ._autotune_log import wrap as _wrap_autotune
 from ._fused_prep import fused_preprocess
 from ._tri_fwd import _has_tma
 
@@ -308,6 +309,10 @@ def _forward_int8_ptr(
         (output / row_sum[:, None]).to(tl.bfloat16),
         mask=q_rows_ok[:, None],
     )
+
+
+_wrap_autotune(_forward_int8, "int8 forward (descriptor)")
+_wrap_autotune(_forward_int8_ptr, "int8 forward (pointer)")
 
 
 def sol_attn_int8(q, k, v, *, scale=None, tau=1.0, sink_blocks=(0, 0), sink_q=(0, 0),
