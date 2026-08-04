@@ -91,7 +91,7 @@ def _ineligible(q, k, mask, dim_head, min_tokens):
 
 def _run(q, k, v, heads, skip_reshape, skip_output_reshape, scale,
          tau, min_tokens, verbose, int8_qk=False, sink_blocks=(0, 0),
-         sink_q=(0, 0)):
+         sink_q=(0, 0), disable_tma=False):
     """Returns the attention output, or None if this call should stay dense."""
     if skip_reshape:
         b, _, _, dim_head = q.shape          # BHND
@@ -114,6 +114,7 @@ def _run(q, k, v, heads, skip_reshape, skip_output_reshape, scale,
     out = kernel(
         qs, ks, vs,
         scale=scale, tau=tau, sink_blocks=sink_blocks, sink_q=sink_q,
+        disable_tma=disable_tma,
     )  # BTHD
     _stats["sparse"] += 1
     if verbose:
@@ -150,7 +151,8 @@ def _sink_blocks(transformer_options, tokens, mode):
 
 def make_override(tau=1.0, min_tokens=4096,
                   sigma_start=None, sigma_end=None, verbose=False,
-                  int8_qk=False, sink_conditioning="exact_kv", previous=None):
+                  int8_qk=False, sink_conditioning="exact_kv", disable_tma=False,
+                  previous=None):
     """Build an optimized_attention_override callable.
 
     ``previous`` chains any override already installed on the model: every path
@@ -191,7 +193,7 @@ def make_override(tau=1.0, min_tokens=4096,
         try:
             out = _run(q, k, v, heads, skip_reshape, skip_output_reshape,
                        kwargs.get("scale", None), tau,
-                       min_tokens, verbose, int8_qk, sink, sink_q)
+                       min_tokens, verbose, int8_qk, sink, sink_q, disable_tma)
         except Exception as exc:
             _stats["errors"] += 1
             _log_kernel_failure(exc)
@@ -313,6 +315,14 @@ class SolAttnPatch(io.ComfyNode):
                                        "spacing is non-uniform; try this if 3d degrades at some "
                                        "frame counts)."),
                 io.Boolean.Input("verbose", default=False),
+                io.Boolean.Input("disable_tma", default=False,
+                                 tooltip="Run the pointer kernels instead of the TMA "
+                                         "descriptor path. They read strides directly, so "
+                                         "q/k/v are never copied contiguous and padded: "
+                                         "peak VRAM drops from ~4x a q/k/v tensor to ~2x "
+                                         "(int8) or ~1x (bf16), and the copies' bandwidth "
+                                         "goes away too. Worth benchmarking both ways. "
+                                         "No effect below SM90, which never uses TMA."),
             ],
             outputs=[io.Model.Output()],
         )
@@ -320,7 +330,7 @@ class SolAttnPatch(io.ComfyNode):
     @classmethod
     def execute(cls, model, tau, start_percent, end_percent,
                 min_tokens, int8_qk, sink_conditioning, morton,
-                morton_curve, verbose) -> io.NodeOutput:
+                morton_curve, verbose, disable_tma=False) -> io.NodeOutput:
         if _sol_attn_kernel is None:
             raise RuntimeError(f"Sol-Attn kernel unavailable: {_IMPORT_ERROR}")
         if int8_qk and _sol_attn_int8_kernel is None:
@@ -389,7 +399,8 @@ class SolAttnPatch(io.ComfyNode):
             make_override(tau=tau, min_tokens=min_tokens,
                           sigma_start=sigma_start, sigma_end=sigma_end,
                           verbose=verbose, int8_qk=int8_qk,
-                          sink_conditioning=sink_conditioning, previous=previous)
+                          sink_conditioning=sink_conditioning,
+                          disable_tma=disable_tma, previous=previous)
         if reorder:
             m.model_options["transformer_options"]["sol_morton"] = True
             m.model_options["transformer_options"]["sol_morton_curve"] = morton_curve

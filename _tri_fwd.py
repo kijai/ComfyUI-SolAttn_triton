@@ -346,12 +346,17 @@ def sol_attn(
     cornish_fisher: bool = False,
     sink_blocks: tuple = (0, 0),
     sink_q: tuple = (0, 0),
+    disable_tma: bool = False,
 ) -> torch.Tensor:
-    """Run Sol-Attn on BTHD inputs."""
+    """Run Sol-Attn on BTHD inputs.
+
+    ``disable_tma`` forces the pointer kernels, which read strides directly and
+    so never materialise the descriptor path's contiguous+padded copies of q/k/v.
+    """
     scale = q.shape[-1] ** -0.5 if scale is None else float(scale)
     tau = float(tau)
     batch, _, heads, head_dim = q.shape
-    use_tma = _has_tma(q.device)
+    use_tma = _has_tma(q.device) and not disable_tma
     if use_tma:
         q, tokens, padded = _to_blocks(q, BLOCK)
         k, _, _ = _to_blocks(k, BLOCK)
