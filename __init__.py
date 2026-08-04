@@ -199,6 +199,37 @@ def make_override(tau=1.0, min_tokens=4096,
     return override
 
 
+def _compose_module_patch(module, patched_forward, sigma_start, sigma_end, min_tokens):
+    """Gate an object-patched attention forward (e.g. KJNodes' memory-efficient
+    Sage): calls Sol-Attn would take run the stock forward, and so reach the
+    override; the rest keeps the patch. The override re-checks on the actual
+    q/k/v, so a disagreement costs one dense call, never a wrong result.
+    """
+    stock = type(module).forward
+
+    def forward(*args, **kwargs):
+        x = args[0] if args else None
+        take = torch.is_tensor(x) and x.device.type == "cuda" \
+            and x.dtype == torch.bfloat16 and x.ndim in (2, 3)
+        if take:
+            # H3 packs tokens first (s, dim); Wan/LTX2 are batch-first.
+            tokens = x.shape[0] if x.ndim == 2 else x.shape[1]
+            take = tokens >= min_tokens
+        if take:
+            options = kwargs.get("transformer_options")
+            if not isinstance(options, dict):
+                options = next((a for a in args if isinstance(a, dict) and "sigmas" in a), {})
+            sigmas = options.get("sigmas")
+            if sigmas is not None:
+                sigma = float(sigmas[0])
+                take = not (sigma > sigma_start or sigma < sigma_end)
+        if take:
+            return stock(module, *args, **kwargs)
+        return patched_forward(*args, **kwargs)
+
+    return forward
+
+
 class SolAttnPatch(io.ComfyNode):
     @classmethod
     def define_schema(cls):
@@ -291,6 +322,25 @@ class SolAttnPatch(io.ComfyNode):
         if previous is not None:
             logging.info("[sol_attn] chaining onto an existing attention override; "
                          "Sol-Attn takes first refusal and delegates everything else to it")
+
+        # Forward-level patches bypass optimized_attention entirely, so there is
+        # nothing to chain onto -- gate each one instead (see _compose_module_patch).
+        composed = []
+        for key, patched in list(m.object_patches.items()):
+            if not key.endswith(".forward"):
+                continue
+            owner = key.rsplit(".", 2)[-2].lower()
+            if "attn" not in owner or "cross" in owner or owner == "attn2":
+                continue  # Sol-Attn never takes cross-attention; leave it patched
+            module = m.get_model_object(key[: -len(".forward")])
+            m.add_object_patch(key, _compose_module_patch(
+                module, patched, sigma_start, sigma_end, min_tokens))
+            composed.append(key)
+        if composed:
+            logging.info(
+                f"[sol_attn] composed with {len(composed)} object-patched attention "
+                f"forward(s) (e.g. {composed[0]}): Sol-Attn takes eligible "
+                "self-attention calls, the existing patch keeps the rest")
         m.model_options["transformer_options"]["optimized_attention_override"] = \
             make_override(tau=tau, min_tokens=min_tokens,
                           sigma_start=sigma_start, sigma_end=sigma_end,
