@@ -304,11 +304,11 @@ _wrap_autotune(_forward_int8_ptr, "int8 forward (pointer)")
 
 
 def sol_attn_int8(q, k, v, *, scale=None, tau=1.0, sink_blocks=(0, 0), sink_q=(0, 0),
-                  cornish_fisher=False, disable_tma=False):
+                  cornish_fisher=False, use_tma=False):
     """Sol-Attn with an INT8 exact branch. Same contract as the BF16 kernel."""
     scale = q.shape[-1] ** -0.5 if scale is None else float(scale)
     batch, _, heads, head_dim = q.shape
-    use_tma = _has_tma(q.device) and not disable_tma
+    use_tma = use_tma and _has_tma(q.device)
     if use_tma:
         q, tokens, padded = _to_blocks(q, BLOCK)
         v, _, _ = _to_blocks(v, BLOCK)

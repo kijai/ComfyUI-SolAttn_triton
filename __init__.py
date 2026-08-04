@@ -21,10 +21,11 @@ from comfy_api.latest import ComfyExtension, io
 from ._autotune_log import set_verbose as _set_autotune_verbose
 
 try:
-    from ._tri_fwd import sol_attn as _sol_attn_kernel
+    from ._tri_fwd import sol_attn as _sol_attn_kernel, _has_tma
     _IMPORT_ERROR = None
 except Exception as exc:  # triton / torch version issues
     _sol_attn_kernel = None
+    _has_tma = None
     _IMPORT_ERROR = exc
 
 try:
@@ -91,7 +92,7 @@ def _ineligible(q, k, mask, dim_head, min_tokens):
 
 def _run(q, k, v, heads, skip_reshape, skip_output_reshape, scale,
          tau, min_tokens, verbose, int8_qk=False, sink_blocks=(0, 0),
-         sink_q=(0, 0), disable_tma=False):
+         sink_q=(0, 0), use_tma=False):
     """Returns the attention output, or None if this call should stay dense."""
     if skip_reshape:
         b, _, _, dim_head = q.shape          # BHND
@@ -114,13 +115,16 @@ def _run(q, k, v, heads, skip_reshape, skip_output_reshape, scale,
     out = kernel(
         qs, ks, vs,
         scale=scale, tau=tau, sink_blocks=sink_blocks, sink_q=sink_q,
-        disable_tma=disable_tma,
+        use_tma=use_tma,
     )  # BTHD
     _stats["sparse"] += 1
     if verbose:
         mode = "int8" if int8_qk else "bf16"
-        _log_once((tuple(qs.shape), "sparse", mode),
-                  f"sparse {tuple(qs.shape)} tau={tau} {mode}")
+        # The kernels also require SM90+ and a Triton with TensorDescriptor, so
+        # report the path actually taken rather than what was asked for.
+        path = "tma" if (use_tma and _has_tma(qs.device)) else "pointer"
+        _log_once((tuple(qs.shape), "sparse", mode, path),
+                  f"sparse {tuple(qs.shape)} tau={tau} {mode} {path}")
 
     if skip_output_reshape:
         return out.transpose(1, 2)           # BHND
@@ -151,7 +155,7 @@ def _sink_blocks(transformer_options, tokens, mode):
 
 def make_override(tau=1.0, min_tokens=4096,
                   sigma_start=None, sigma_end=None, verbose=False,
-                  int8_qk=False, sink_conditioning="exact_kv", disable_tma=False,
+                  int8_qk=False, sink_conditioning="exact_kv", use_tma=False,
                   previous=None):
     """Build an optimized_attention_override callable.
 
@@ -193,7 +197,7 @@ def make_override(tau=1.0, min_tokens=4096,
         try:
             out = _run(q, k, v, heads, skip_reshape, skip_output_reshape,
                        kwargs.get("scale", None), tau,
-                       min_tokens, verbose, int8_qk, sink, sink_q, disable_tma)
+                       min_tokens, verbose, int8_qk, sink, sink_q, use_tma)
         except Exception as exc:
             _stats["errors"] += 1
             _log_kernel_failure(exc)
@@ -315,14 +319,15 @@ class SolAttnPatch(io.ComfyNode):
                                        "spacing is non-uniform; try this if 3d degrades at some "
                                        "frame counts)."),
                 io.Boolean.Input("verbose", default=False),
-                io.Boolean.Input("disable_tma", default=False,
-                                 tooltip="Run the pointer kernels instead of the TMA "
-                                         "descriptor path. They read strides directly, so "
-                                         "q/k/v are never copied contiguous and padded: "
-                                         "peak VRAM drops from ~4x a q/k/v tensor to ~2x "
-                                         "(int8) or ~1x (bf16), and the copies' bandwidth "
-                                         "goes away too. Worth benchmarking both ways. "
-                                         "No effect below SM90, which never uses TMA."),
+                io.Boolean.Input("use_tma", default=False,
+                                 tooltip="Use the TMA descriptor kernels instead of the "
+                                         "pointer ones. They need contiguous, block-padded "
+                                         "q/k/v, so enabling this copies the inputs: peak "
+                                         "VRAM goes from ~1x (bf16) / ~2x (int8) a q/k/v "
+                                         "tensor to ~4x, plus the copy bandwidth. Off by "
+                                         "default because it has not measured faster on any "
+                                         "tested GPU. Requires SM90+ and Triton 3.3+; "
+                                         "ignored otherwise. 'verbose' logs the path used."),
             ],
             outputs=[io.Model.Output()],
         )
@@ -330,7 +335,7 @@ class SolAttnPatch(io.ComfyNode):
     @classmethod
     def execute(cls, model, tau, start_percent, end_percent,
                 min_tokens, int8_qk, sink_conditioning, morton,
-                morton_curve, verbose, disable_tma=False) -> io.NodeOutput:
+                morton_curve, verbose, use_tma=False) -> io.NodeOutput:
         if _sol_attn_kernel is None:
             raise RuntimeError(f"Sol-Attn kernel unavailable: {_IMPORT_ERROR}")
         if int8_qk and _sol_attn_int8_kernel is None:
@@ -400,7 +405,7 @@ class SolAttnPatch(io.ComfyNode):
                           sigma_start=sigma_start, sigma_end=sigma_end,
                           verbose=verbose, int8_qk=int8_qk,
                           sink_conditioning=sink_conditioning,
-                          disable_tma=disable_tma, previous=previous)
+                          use_tma=use_tma, previous=previous)
         if reorder:
             m.model_options["transformer_options"]["sol_morton"] = True
             m.model_options["transformer_options"]["sol_morton_curve"] = morton_curve

@@ -1,8 +1,9 @@
 """Triton Sol-Attn forward kernels.
 
-``_forward`` uses TensorDescriptor loads (TMA on SM90+); ``_forward_ptr`` is
-the pointer twin for older arches, where Triton's descriptor emulation costs
-2.4-3.6x. ``sol_attn`` dispatches by device capability.
+``_forward_ptr`` reads strides directly and is the default. ``_forward`` uses
+TensorDescriptor loads (TMA on SM90+) but needs contiguous, block-padded q/k/v,
+so it copies its inputs; below SM90 Triton emulates descriptors at 2.4-3.6x the
+cost. ``sol_attn`` takes the descriptor path only when asked via ``use_tma``.
 """
 
 import logging
@@ -346,17 +347,19 @@ def sol_attn(
     cornish_fisher: bool = False,
     sink_blocks: tuple = (0, 0),
     sink_q: tuple = (0, 0),
-    disable_tma: bool = False,
+    use_tma: bool = False,
 ) -> torch.Tensor:
     """Run Sol-Attn on BTHD inputs.
 
-    ``disable_tma`` forces the pointer kernels, which read strides directly and
-    so never materialise the descriptor path's contiguous+padded copies of q/k/v.
+    ``use_tma`` opts into the descriptor kernels. They need contiguous, block-
+    padded q/k/v, so the inputs are copied; the pointer kernels read strides
+    directly and copy nothing. Off by default: the copies are not free and the
+    descriptor path has not measured faster on any tested GPU.
     """
     scale = q.shape[-1] ** -0.5 if scale is None else float(scale)
     tau = float(tau)
     batch, _, heads, head_dim = q.shape
-    use_tma = _has_tma(q.device) and not disable_tma
+    use_tma = use_tma and _has_tma(q.device)
     if use_tma:
         q, tokens, padded = _to_blocks(q, BLOCK)
         k, _, _ = _to_blocks(k, BLOCK)
