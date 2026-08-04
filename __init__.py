@@ -312,7 +312,7 @@ class SolAttnPatch(io.ComfyNode):
                                          "2-row strip, which makes routing far more accurate at a "
                                          "given density. Exactly neutral for dense attention. "
                                          "Wan and MiniMax-H3 only; logged and skipped elsewhere."),
-                io.Combo.Input("morton_curve", options=["3d", "2d_frame"], default="3d",
+                io.Combo.Input("morton_curve", options=["3d", "2d_frame"], default="2d_frame",
                                tooltip="3d interleaves t/h/w equally. 2d_frame Z-orders within "
                                        "each frame and leaves frame order alone -- use it when the "
                                        "temporal axis is not uniformly spaced (MiniMax-H3's frame "
