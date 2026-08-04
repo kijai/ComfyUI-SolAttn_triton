@@ -79,7 +79,7 @@ def _forward_int8(
     q_rows = q_start + token_offsets
     q_valid = q_rows < T
     qi = tl.load(
-        qi_ptr + ((batch * TP + q_rows[:, None]) * H + head) * D + d_offsets[None, :],
+        qi_ptr + ((batch * TP + q_rows[:, None]).to(tl.int64) * H + head) * D + d_offsets[None, :],
         mask=q_valid[:, None],
         other=0,
     )
@@ -134,7 +134,7 @@ def _forward_int8(
             k_valid = k_rows < T
 
             ki = tl.load(
-                ki_ptr + ((batch * TP + k_rows[:, None]) * H + head) * D + d_offsets[None, :],
+                ki_ptr + ((batch * TP + k_rows[:, None]).to(tl.int64) * H + head) * D + d_offsets[None, :],
                 mask=k_valid[:, None],
                 other=0,
             )
@@ -207,7 +207,7 @@ def _forward_int8_ptr(
 
     q_rows_ok = q_start + token_offsets < TP
     q = tl.load(
-        q_ptr + batch * sq_b + (q_start + token_offsets[:, None]) * sq_t
+        q_ptr + batch * sq_b + (q_start + token_offsets[:, None]).to(tl.int64) * sq_t
         + head * sq_h + d_offsets[None, :],
         mask=q_rows_ok[:, None],
         other=0.0,
@@ -218,7 +218,7 @@ def _forward_int8_ptr(
     q_rows = q_start + token_offsets
     q_valid = q_rows < T
     qi = tl.load(
-        qi_ptr + ((batch * TP + q_rows[:, None]) * H + head) * D + d_offsets[None, :],
+        qi_ptr + ((batch * TP + q_rows[:, None]).to(tl.int64) * H + head) * D + d_offsets[None, :],
         mask=q_valid[:, None],
         other=0,
     )
@@ -279,7 +279,7 @@ def _forward_int8_ptr(
             k_valid = k_rows < T
 
             ki = tl.load(
-                ki_ptr + ((batch * TP + k_rows[:, None]) * H + head) * D + d_offsets[None, :],
+                ki_ptr + ((batch * TP + k_rows[:, None]).to(tl.int64) * H + head) * D + d_offsets[None, :],
                 mask=k_valid[:, None],
                 other=0,
             )
@@ -294,7 +294,7 @@ def _forward_int8_ptr(
             exact_probability = tl.math.exp2(exact_scores - new_max[:, None])
             row_sum = row_sum * alpha + tl.sum(exact_probability, axis=1)
             v = tl.load(
-                v_ptr + batch * sv_b + (kv_start + token_offsets[:, None]) * sv_t
+                v_ptr + batch * sv_b + (kv_start + token_offsets[:, None]).to(tl.int64) * sv_t
                 + head * sv_h + bv_offsets[None, :],
                 mask=k_valid[:, None],
                 other=0.0,
@@ -303,7 +303,7 @@ def _forward_int8_ptr(
             row_max = new_max
 
     tl.store(
-        o_ptr + ((batch * TP + q_start + token_offsets[:, None]) * H + head) * D
+        o_ptr + ((batch * TP + q_start + token_offsets[:, None]).to(tl.int64) * H + head) * D
         + bv_offsets[None, :],
         (output / row_sum[:, None]).to(tl.bfloat16),
         mask=q_rows_ok[:, None],

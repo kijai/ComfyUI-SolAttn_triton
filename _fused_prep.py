@@ -34,9 +34,9 @@ def _q_quant_threshold_kernel(
     valid = rows < T
     q_len = tl.minimum(BLOCK, T - q_block * BLOCK).to(tl.float32)
 
-    offs = ((batch * TP + rows[:, None]) * H + head) * D + d[None, :]
+    offs = ((batch * TP + rows[:, None]).to(tl.int64) * H + head) * D + d[None, :]
     x = tl.load(
-        q_ptr + batch * s_b + rows[:, None] * s_t + head * s_h + d[None, :],
+        q_ptr + batch * s_b + rows[:, None].to(tl.int64) * s_t + head * s_h + d[None, :],
         mask=valid[:, None], other=0.0,
     ).to(tl.float32)
 

@@ -213,7 +213,7 @@ def _forward_ptr(
     q_start = q_block * BLOCK_SIZE
     q_rows_ok = q_start + token_offsets < TP
     q = tl.load(
-        q_ptr + batch * sq_b + (q_start + token_offsets[:, None]) * sq_t
+        q_ptr + batch * sq_b + (q_start + token_offsets[:, None]).to(tl.int64) * sq_t
         + head * sq_h + d_offsets[None, :],
         mask=q_rows_ok[:, None],
         other=0.0,
@@ -282,7 +282,7 @@ def _forward_ptr(
             kv_start = block * BLOCK_SIZE
             kv_ok = kv_start + token_offsets < T
             k = tl.load(
-                k_ptr + batch * sk_b + (kv_start + token_offsets[:, None]) * sk_t
+                k_ptr + batch * sk_b + (kv_start + token_offsets[:, None]).to(tl.int64) * sk_t
                 + head * sk_h + d_offsets[None, :],
                 mask=kv_ok[:, None],
                 other=0.0,
@@ -294,7 +294,7 @@ def _forward_ptr(
             exact_probability = tl.math.exp2(exact_scores - new_max[:, None])
             row_sum = row_sum * alpha + tl.sum(exact_probability, axis=1)
             v = tl.load(
-                v_ptr + batch * sv_b + (kv_start + token_offsets[:, None]) * sv_t
+                v_ptr + batch * sv_b + (kv_start + token_offsets[:, None]).to(tl.int64) * sv_t
                 + head * sv_h + bv_offsets[None, :],
                 mask=kv_ok[:, None],
                 other=0.0,
@@ -305,7 +305,7 @@ def _forward_ptr(
             row_max = new_max
 
     tl.store(
-        o_ptr + ((batch * TP + q_start + token_offsets[:, None]) * H + head) * D
+        o_ptr + ((batch * TP + q_start + token_offsets[:, None]).to(tl.int64) * H + head) * D
         + bv_offsets[None, :],
         (output / row_sum[:, None]).to(tl.bfloat16),
         mask=q_rows_ok[:, None],
