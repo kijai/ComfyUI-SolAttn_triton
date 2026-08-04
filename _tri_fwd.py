@@ -39,16 +39,21 @@ BLOCK = 64
 GROUP = 32
 
 
-def _pad_to_blocks(q, k, v, block):
-    """Pad tokens to whole blocks for the TMA path's unmasked descriptor I/O."""
-    tokens = q.shape[1]
-    blocks = (tokens + block - 1) // block
-    padded = blocks * block
-    if padded == tokens:
-        return q, k, v, tokens, padded
-    pad = (0, 0, 0, 0, 0, padded - tokens)
-    return (torch.nn.functional.pad(q, pad), torch.nn.functional.pad(k, pad),
-            torch.nn.functional.pad(v, pad), tokens, padded)
+def _to_blocks(t, block):
+    """Contiguous copy padded to whole blocks for the descriptor path's unmasked I/O.
+
+    One allocation per tensor, taken one at a time: contiguous() followed by a
+    separate pad would hold two full copies of all three inputs at once.
+    """
+    tokens = t.shape[1]
+    padded = (tokens + block - 1) // block * block
+    if padded == tokens and t.is_contiguous():
+        return t, tokens, padded
+    out = torch.empty((t.shape[0], padded) + t.shape[2:],
+                      device=t.device, dtype=t.dtype)
+    out[:, :tokens].copy_(t)
+    out[:, tokens:].zero_()
+    return out, tokens, padded
 
 
 @triton.autotune(
@@ -348,8 +353,9 @@ def sol_attn(
     batch, _, heads, head_dim = q.shape
     use_tma = _has_tma(q.device)
     if use_tma:
-        q, k, v = q.contiguous(), k.contiguous(), v.contiguous()
-        q, k, v, tokens, padded = _pad_to_blocks(q, k, v, BLOCK)
+        q, tokens, padded = _to_blocks(q, BLOCK)
+        k, _, _ = _to_blocks(k, BLOCK)
+        v, _, _ = _to_blocks(v, BLOCK)
     else:
         # Pointer kernels mask ragged tails and take strides, so skip the
         # contiguous+pad copies (a multi-GB transient at video lengths).

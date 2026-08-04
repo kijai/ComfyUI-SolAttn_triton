@@ -9,6 +9,7 @@ import triton.language as tl
 def _quant_kernel(
     x_ptr, mean_ptr, xi_ptr, xs_ptr,
     T,
+    TP,  # batch stride of xi/xs; x itself may be shorter (unpadded input)
     s_b, s_t, s_h,  # x strides (last dim contiguous); xi/xs are dense allocations
     H: tl.constexpr,
     D: tl.constexpr,
@@ -35,19 +36,22 @@ def _quant_kernel(
     xi = tl.extra.cuda.libdevice.round(x / s_safe[:, None])
     xi = tl.minimum(tl.maximum(xi, -127.0), 127.0).to(tl.int8)
 
-    offs_out = ((batch * T + rows[:, None]).to(tl.int64) * H + head) * D + d[None, :]
+    offs_out = ((batch * TP + rows[:, None]).to(tl.int64) * H + head) * D + d[None, :]
     tl.store(xi_ptr + offs_out, xi, mask=valid[:, None])
-    tl.store(xs_ptr + (batch * T + rows) * H + head, s_safe, mask=valid)
+    tl.store(xs_ptr + (batch * TP + rows) * H + head, s_safe, mask=valid)
 
 
-def quantize_bthd(x, mean=None, rows=16, num_warps=4):
+def quantize_bthd(x, mean=None, rows=16, num_warps=4, out_rows=None):
+    """``out_rows`` sizes the outputs when x is shorter than the padded layout
+    the forward kernels index; the tail rows are never read (masked)."""
     B, T, H, D = x.shape
-    xi = torch.empty((B, T, H, D), device=x.device, dtype=torch.int8)
-    xs = torch.empty((B, T, H), device=x.device, dtype=torch.float32)
+    TP = T if out_rows is None else int(out_rows)
+    xi = torch.empty((B, TP, H, D), device=x.device, dtype=torch.int8)
+    xs = torch.empty((B, TP, H), device=x.device, dtype=torch.float32)
     grid = (triton.cdiv(T, rows), B * H)
     _quant_kernel[grid](
         x, mean if mean is not None else x, xi, xs,
-        T, x.stride(0), x.stride(1), x.stride(2), H, D, rows, mean is not None,
+        T, TP, x.stride(0), x.stride(1), x.stride(2), H, D, rows, mean is not None,
         num_warps=num_warps,
     )
     return xi, xs

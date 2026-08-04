@@ -98,7 +98,8 @@ def fused_preprocess(q, k, v, *, tau, scale, tokens=None,
     else:
         kc_k3 = kc_k4 = kc_var
 
-    ki, ks = quantize_bthd(k, mean=k_mean.reshape(B * H, D).contiguous())
+    # k may be shorter than q here
+    ki, ks = quantize_bthd(k, mean=k_mean.reshape(B * H, D).contiguous(), out_rows=padded)
 
     # Quantize Q and compute thresholds from one load.
     qi = torch.empty((B, padded, H, D), device=q.device, dtype=torch.int8)

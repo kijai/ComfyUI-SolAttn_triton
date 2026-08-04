@@ -16,23 +16,11 @@ except Exception:
 
 from ._autotune_log import wrap as _wrap_autotune
 from ._fused_prep import fused_preprocess
-from ._tri_fwd import _has_tma
+from ._tri_fwd import _has_tma, _to_blocks
 
 
 BLOCK = 64
 GROUP = 32
-
-
-def _pad_to_blocks(q, k, v, block):
-    """Pad tokens to whole blocks for the TMA path's unmasked descriptor I/O."""
-    tokens = q.shape[1]
-    blocks = (tokens + block - 1) // block
-    padded = blocks * block
-    if padded == tokens:
-        return q, k, v, tokens, padded
-    pad = (0, 0, 0, 0, 0, padded - tokens)
-    return (torch.nn.functional.pad(q, pad), torch.nn.functional.pad(k, pad),
-            torch.nn.functional.pad(v, pad), tokens, padded)
 
 
 @triton.autotune(
@@ -322,8 +310,11 @@ def sol_attn_int8(q, k, v, *, scale=None, tau=1.0, sink_blocks=(0, 0), sink_q=(0
     batch, _, heads, head_dim = q.shape
     use_tma = _has_tma(q.device)
     if use_tma:
-        q, k, v = q.contiguous(), k.contiguous(), v.contiguous()
-        q, k, v, tokens, padded = _pad_to_blocks(q, k, v, BLOCK)
+        q, tokens, padded = _to_blocks(q, BLOCK)
+        v, _, _ = _to_blocks(v, BLOCK)
+        # k only feeds the strided preprocess kernels, never a descriptor.
+        if k.stride(-1) != 1:
+            k = k.contiguous()
     else:
         # Pointer kernel and quantizer take strides; skip the copies.
         if q.stride(-1) != 1 or k.stride(-1) != 1 or v.stride(-1) != 1:
@@ -335,6 +326,7 @@ def sol_attn_int8(q, k, v, *, scale=None, tau=1.0, sink_blocks=(0, 0), sink_q=(0
         q, k, v, tau=tau, scale=scale, tokens=tokens,
         cornish_fisher=cornish_fisher
     )
+    del k  # only ki/ks reach the kernels from here on
 
     output = torch.empty((batch, padded, heads, head_dim),
                          device=v.device, dtype=v.dtype)
