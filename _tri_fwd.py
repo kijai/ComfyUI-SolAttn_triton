@@ -5,20 +5,34 @@ the pointer twin for older arches, where Triton's descriptor emulation costs
 2.4-3.6x. ``sol_attn`` dispatches by device capability.
 """
 
+import logging
+
 import torch
 import triton
 import triton.language as tl
 try:
     from triton.tools.tensor_descriptor import TensorDescriptor
-except ModuleNotFoundError:
+except Exception:
     TensorDescriptor = None
 
 from ._autotune_log import wrap as _wrap_autotune
 from ._preprocess import prepare
 
+_logged_no_descriptor = False
+
 
 def _has_tma(device):
-    return torch.cuda.get_device_capability(device)[0] >= 9
+    # TensorDescriptor arrived in Triton 3.3; older installs run the pointer twin.
+    if torch.cuda.get_device_capability(device)[0] < 9:
+        return False
+    if TensorDescriptor is None:
+        global _logged_no_descriptor
+        if not _logged_no_descriptor:
+            _logged_no_descriptor = True
+            logging.info("[sol_attn] this Triton has no TensorDescriptor; using the "
+                         "pointer kernels. Update Triton to use TMA on this GPU.")
+        return False
+    return True
 
 
 BLOCK = 64
@@ -336,8 +350,6 @@ def sol_attn(
     if use_tma:
         q, k, v = q.contiguous(), k.contiguous(), v.contiguous()
         q, k, v, tokens, padded = _pad_to_blocks(q, k, v, BLOCK)
-        if TensorDescriptor is None:
-            raise RuntimeError("TensorDescriptor is unavailable for the TMA path.")
     else:
         # Pointer kernels mask ragged tails and take strides, so skip the
         # contiguous+pad copies (a multi-GB transient at video lengths).
