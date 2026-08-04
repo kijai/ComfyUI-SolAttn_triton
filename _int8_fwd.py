@@ -9,7 +9,10 @@ nothing.
 import torch
 import triton
 import triton.language as tl
-from triton.tools.tensor_descriptor import TensorDescriptor
+try:
+    from triton.tools.tensor_descriptor import TensorDescriptor
+except ModuleNotFoundError:
+    TensorDescriptor = None
 
 from ._fused_prep import fused_preprocess
 from ._tri_fwd import _has_tma
@@ -316,6 +319,8 @@ def sol_attn_int8(q, k, v, *, scale=None, tau=1.0, sink_blocks=(0, 0), sink_q=(0
     if use_tma:
         q, k, v = q.contiguous(), k.contiguous(), v.contiguous()
         q, k, v, tokens, padded = _pad_to_blocks(q, k, v, BLOCK)
+        if TensorDescriptor is None:
+            raise RuntimeError("TensorDescriptor is unavailable for the TMA path.")
     else:
         # Pointer kernel and quantizer take strides; skip the copies.
         if q.stride(-1) != 1 or k.stride(-1) != 1 or v.stride(-1) != 1:
