@@ -352,7 +352,7 @@ _wrap_autotune(_forward_int8_ptr, "int8 forward (pointer)")
 
 
 def sol_attn_int8(q, k, v, *, scale=None, tau=1.0, sink_blocks=(0, 0), sink_q=(0, 0),
-                  cornish_fisher=False, use_tma=False, int8_pv=True):
+                  use_tma=False, int8_pv=True):
     """Sol-Attn with an INT8 exact branch. Same contract as the BF16 kernel."""
     scale = q.shape[-1] ** -0.5 if scale is None else float(scale)
     batch, _, heads, head_dim = q.shape
@@ -374,7 +374,7 @@ def sol_attn_int8(q, k, v, *, scale=None, tau=1.0, sink_blocks=(0, 0), sink_q=(0
 
     kc, vc, threshold, qi, qs, ki, ks, vi, vsc = fused_preprocess(
         q, k, v, tau=tau, scale=scale, tokens=tokens,
-        cornish_fisher=cornish_fisher, int8_pv=int8_pv,
+        int8_pv=int8_pv,
     )
     del k  # the forward reaches K only as ki/ks
     if vi is None:

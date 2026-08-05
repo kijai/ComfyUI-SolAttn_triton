@@ -15,7 +15,7 @@ from ._fused_quant import quantize_bthd, quantize_v_per_channel
 
 @triton.jit
 def _q_quant_threshold_kernel(
-    q_ptr, kc_var_ptr, kc_k3_ptr, kc_k4_ptr, qi_ptr, qs_ptr, thr_ptr,
+    q_ptr, kc_var_ptr, qi_ptr, qs_ptr, thr_ptr,
     softmax_scale,
     T,
     TP,  # padded token count: the batch stride of qi/qs (T is only the mask bound)
@@ -25,7 +25,6 @@ def _q_quant_threshold_kernel(
     D: tl.constexpr,
     BLOCK: tl.constexpr,
     tau_ptr,
-    CORNISH_FISHER: tl.constexpr,
 ):
     q_block, batch_head = tl.program_id(0), tl.program_id(1)
     batch, head = batch_head // H, batch_head % H
@@ -56,27 +55,11 @@ def _q_quant_threshold_kernel(
     variance = tl.sum(c2 * var_kc, axis=0) * (log2_scale * log2_scale)
 
     TAU = tl.load(tau_ptr + head)
-    offset = TAU
-    if CORNISH_FISHER:
-        k3_d = tl.load(kc_k3_ptr + batch_head * D + d)
-        k4_d = tl.load(kc_k4_ptr + batch_head * D + d)
-        raw_sd = tl.sqrt(tl.maximum(tl.sum(c2 * var_kc, axis=0), 0.0) + 1.0e-12)
-        g1 = tl.sum(c2 * centroid * k3_d, axis=0) / (raw_sd * raw_sd * raw_sd)
-        g2 = tl.sum(c2 * c2 * k4_d, axis=0) / (raw_sd * raw_sd * raw_sd * raw_sd)
-        g1 = tl.minimum(tl.maximum(g1, -2.0), 2.0)
-        g2 = tl.minimum(tl.maximum(g2, -5.0), 5.0)
-        z = TAU
-        offset = (z + (z * z - 1.0) * g1 / 6.0
-                  + (z * z * z - 3.0 * z) * g2 / 24.0
-                  - (2.0 * z * z * z - 5.0 * z) * g1 * g1 / 36.0)
-        offset = tl.minimum(tl.maximum(offset, z - 1.0), z + 1.0)
-
     tl.store(thr_ptr + (batch * N + q_block) * H + head,
-             offset * tl.sqrt(variance + 1.0e-6))
+             TAU * tl.sqrt(variance + 1.0e-6))
 
 
-def fused_preprocess(q, k, v, *, tau, scale, tokens=None,
-                     cornish_fisher=False, int8_pv=True):
+def fused_preprocess(q, k, v, *, tau, scale, tokens=None, int8_pv=True):
     """Returns (kc, vc, threshold, qi, qs, ki, ks, vi, vsc) with K smoothed.
 
     ``tokens`` is the true sequence length; q may be padded past it (TMA path).
@@ -92,11 +75,6 @@ def fused_preprocess(q, k, v, *, tau, scale, tokens=None,
     kc[:, :N] = (kc[:, :N].float() - k_mean.unsqueeze(1)).to(kc.dtype)
     centred = kc[:, :N].float().permute(0, 2, 1, 3)                # [B,H,N,D], zero mean
     kc_var = centred.pow(2).mean(dim=2).contiguous()               # [B,H,D]
-    if cornish_fisher:
-        kc_k3 = centred.pow(3).mean(dim=2).contiguous()
-        kc_k4 = (centred.pow(4).mean(dim=2) - 3.0 * kc_var.pow(2)).contiguous()
-    else:
-        kc_k3 = kc_k4 = kc_var
 
     # k may be shorter than q here
     ki, ks = quantize_bthd(k, mean=k_mean.reshape(B * H, D).contiguous(), out_rows=padded)
@@ -107,10 +85,9 @@ def fused_preprocess(q, k, v, *, tau, scale, tokens=None,
     qs = torch.empty((B, padded, H), device=q.device, dtype=torch.float32)
     threshold = torch.empty((B, N, H), device=q.device, dtype=torch.float32)
     _q_quant_threshold_kernel[(N, B * H)](
-        q, kc_var, kc_k3, kc_k4, qi, qs, threshold, scale, T, padded,
+        q, kc_var, qi, qs, threshold, scale, T, padded,
         q.stride(0), q.stride(1), q.stride(2), H, N, D, BLOCK_SIZE,
         tau_vector(tau, H, q.device),
-        cornish_fisher,
         num_warps=4,
     )
     return kc, vc, threshold, qi, qs, ki, ks, vi, vsc

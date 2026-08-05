@@ -354,7 +354,6 @@ def sol_attn(
     *,
     scale: float | None = None,
     tau: float = 1.0,
-    cornish_fisher: bool = False,
     sink_blocks: tuple = (0, 0),
     sink_q: tuple = (0, 0),
     use_tma: bool = False,
@@ -381,8 +380,7 @@ def sol_attn(
             q, k, v = q.contiguous(), k.contiguous(), v.contiguous()
         tokens = padded = q.shape[1]
     blocks = triton.cdiv(tokens, BLOCK)
-    kc, vc, threshold = prepare(q, k, v, scale=scale, tau=tau, tokens=tokens,
-                                cornish_fisher=cornish_fisher)
+    kc, vc, threshold = prepare(q, k, v, scale=scale, tau=tau, tokens=tokens)
     output = torch.empty((batch, padded, heads, head_dim),
                          device=v.device, dtype=v.dtype)
     if not use_tma:
