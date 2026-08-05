@@ -1,9 +1,8 @@
 """Triton Sol-Attn forward kernels.
 
 ``_forward_ptr`` reads strides directly and is the default. ``_forward`` uses
-TensorDescriptor loads (TMA on SM90+) but needs contiguous, block-padded q/k/v,
-so it copies its inputs; below SM90 Triton emulates descriptors at 2.4-3.6x the
-cost. ``sol_attn`` takes the descriptor path only when asked via ``use_tma``.
+TensorDescriptor loads (TMA on SM90+), which address strided inputs directly, so
+neither path copies q/k/v unless the layout breaks TMA's alignment rules.
 """
 
 import logging
@@ -40,16 +39,25 @@ BLOCK = 64
 GROUP = 32
 
 
-def _to_blocks(t, block):
-    """Contiguous copy padded to whole blocks for the descriptor path's unmasked I/O.
+def _descriptor_ready(t):
+    """Whether TMA can address this tensor as it stands.
 
-    One allocation per tensor, taken one at a time: contiguous() followed by a
-    separate pad would hold two full copies of all three inputs at once.
+    A descriptor needs only a 16-byte aligned base, 16-byte aligned outer
+    strides, and a contiguous last dim.
     """
+    if t.stride(-1) != 1 or t.data_ptr() % 16 != 0:
+        return False
+    itemsize = t.element_size()
+    return all((s * itemsize) % 16 == 0 for s in t.stride()[:-1])
+
+
+def _to_blocks(t, block):
+    """Input for the descriptor path: the tensor itself when TMA can address it,
+    otherwise one contiguous copy padded to whole blocks."""
     tokens = t.shape[1]
+    if _descriptor_ready(t):
+        return t, tokens, tokens
     padded = (tokens + block - 1) // block * block
-    if padded == tokens and t.is_contiguous():
-        return t, tokens, padded
     out = torch.empty((t.shape[0], padded) + t.shape[2:],
                       device=t.device, dtype=t.dtype)
     out[:, :tokens].copy_(t)
