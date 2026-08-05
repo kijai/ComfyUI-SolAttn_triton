@@ -10,7 +10,7 @@ import triton
 import triton.language as tl
 
 from ._preprocess import _reduce_kv, BLOCK_SIZE, tau_vector
-from ._fused_quant import quantize_bthd
+from ._fused_quant import quantize_bthd, quantize_v_per_channel
 
 
 @triton.jit
@@ -76,8 +76,8 @@ def _q_quant_threshold_kernel(
 
 
 def fused_preprocess(q, k, v, *, tau, scale, tokens=None,
-                     cornish_fisher=False):
-    """Returns (kc, vc, threshold, qi, qs, ki, ks) with K smoothed.
+                     cornish_fisher=False, int8_pv=True):
+    """Returns (kc, vc, threshold, qi, qs, ki, ks, vi, vsc) with K smoothed.
 
     ``tokens`` is the true sequence length; q may be padded past it (TMA path).
     """
@@ -100,6 +100,7 @@ def fused_preprocess(q, k, v, *, tau, scale, tokens=None,
 
     # k may be shorter than q here
     ki, ks = quantize_bthd(k, mean=k_mean.reshape(B * H, D).contiguous(), out_rows=padded)
+    vi, vsc = (quantize_v_per_channel(v, out_rows=padded) if int8_pv else (None, None))
 
     # Quantize Q and compute thresholds from one load.
     qi = torch.empty((B, padded, H, D), device=q.device, dtype=torch.int8)
@@ -112,7 +113,7 @@ def fused_preprocess(q, k, v, *, tau, scale, tokens=None,
         cornish_fisher,
         num_warps=4,
     )
-    return kc, vc, threshold, qi, qs, ki, ks
+    return kc, vc, threshold, qi, qs, ki, ks, vi, vsc
 
 
 __all__ = ["fused_preprocess"]

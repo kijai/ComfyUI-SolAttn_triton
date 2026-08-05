@@ -17,6 +17,7 @@ from comfy.ldm.modules.attention import (
     register_attention_function,
     wrap_attn,
 )
+from comfy.patcher_extension import CallbacksMP
 from comfy_api.latest import ComfyExtension, io
 
 from ._autotune_log import set_verbose as _set_autotune_verbose
@@ -87,6 +88,34 @@ def _install_block_index(model):
     return True
 
 
+_probe = {}
+
+
+def _probe_record(block, sparse_out, reference):
+    """Accumulate this block's sparse-vs-dense relative error."""
+    ref = reference.float()
+    norm = ref.norm()
+    if norm > 0:
+        entry = _probe.setdefault(block, [0.0, 0])
+        entry[0] += float((sparse_out.float() - ref).norm() / norm)
+        entry[1] += 1
+
+
+def log_probe_summary(*_args, **_kwargs):
+    """Per-block sensitivity, worst first. Blocks at the top are the ones worth
+    listing in dense_blocks."""
+    if not _probe:
+        return
+    rows = sorted(((total / count, block, count)
+                   for block, (total, count) in _probe.items()), reverse=True)
+    logging.info("[sol_attn] block sensitivity to sparsification (worst first); "
+                 "put the top entries in dense_blocks:")
+    for error, block, count in rows:
+        logging.info(f"[sol_attn]   block {block:3d}  rel err {error:.4f}  "
+                     f"({count} calls)")
+    _probe.clear()
+
+
 def sol_attn_stats():
     """Dispatch counters since process start (or last reset)."""
     return dict(_stats)
@@ -137,7 +166,7 @@ def _ineligible(q, k, mask, dim_head, min_tokens):
 
 def _run(q, k, v, heads, skip_reshape, skip_output_reshape, scale,
          tau, min_tokens, verbose, int8_qk=False, sink_blocks=(0, 0),
-         sink_q=(0, 0), use_tma=False):
+         sink_q=(0, 0), use_tma=False, int8_pv=True):
     """Returns the attention output, or None if this call should stay dense."""
     if skip_reshape:
         b, _, _, dim_head = q.shape          # BHND
@@ -156,11 +185,12 @@ def _run(q, k, v, heads, skip_reshape, skip_output_reshape, scale,
 
     # No contiguous() here: the kernels take strides, so H3's interleaved qkv
     # views go in without copies.
+    extra = {"int8_pv": int8_pv} if int8_qk else {}
     kernel = _sol_attn_int8_kernel if int8_qk else _sol_attn_kernel
     out = kernel(
         qs, ks, vs,
         scale=scale, tau=tau, sink_blocks=sink_blocks, sink_q=sink_q,
-        use_tma=use_tma,
+        use_tma=use_tma, **extra,
     )  # BTHD
     _stats["sparse"] += 1
     if verbose:
@@ -201,7 +231,7 @@ def _sink_blocks(transformer_options, tokens, mode):
 def make_override(tau=1.0, min_tokens=4096,
                   sigma_start=None, sigma_end=None, verbose=False,
                   int8_qk=False, sink_conditioning="exact_kv", use_tma=False,
-                  dense_blocks=frozenset(), previous=None):
+                  dense_blocks=frozenset(), int8_pv=True, previous=None):
     """Build an optimized_attention_override callable.
 
     ``previous`` chains any override already installed on the model: every path
@@ -251,12 +281,35 @@ def make_override(tau=1.0, min_tokens=4096,
         try:
             out = _run(q, k, v, heads, skip_reshape, skip_output_reshape,
                        kwargs.get("scale", None), tau,
-                       min_tokens, verbose, int8_qk, sink, sink_q, use_tma)
+                       min_tokens, verbose, int8_qk, sink, sink_q, use_tma,
+                       int8_pv)
         except Exception as exc:
             _stats["errors"] += 1
             _log_kernel_failure(exc)
             return dense()
         return dense() if out is None else out
+
+    return override
+
+
+def make_probe_override(inner):
+    """Wrap an installed override so every call is computed both ways.
+
+    Returns the dense result, so each block is measured against a clean input;
+    returning the sparse one would let early error compound and inflate every
+    later block's number.
+    """
+
+    def override(func, q, k, v, heads, mask=None, attn_precision=None,
+                 skip_reshape=False, skip_output_reshape=False, **kwargs):
+        common = dict(mask=mask, attn_precision=attn_precision,
+                      skip_reshape=skip_reshape,
+                      skip_output_reshape=skip_output_reshape, **kwargs)
+        sparse = inner(func, q, k, v, heads, **common)
+        reference = func(q, k, v, heads, **common)
+        _probe_record(kwargs.get("transformer_options", {}).get("sol_block"),
+                      sparse, reference)
+        return reference
 
     return override
 
@@ -372,16 +425,20 @@ class SolAttnPatch(io.ComfyNode):
                                        "temporal axis is not uniformly spaced (MiniMax-H3's frame "
                                        "spacing is non-uniform; try this if 3d degrades at some "
                                        "frame counts)."),
+                io.Boolean.Input("int8_pv", default=True,
+                                 tooltip="Also run the exact branch's P@V in INT8, with a "
+                                         "per-row P scale and per-channel V scale. PV and QK "
+                                         "cost the same, so this is the other half of the "
+                                         "int8 win. Only applies when int8_qk is on."),
                 io.Boolean.Input("verbose", default=False),
                 io.Boolean.Input("use_tma", default=False,
                                  tooltip="Use the TMA descriptor kernels instead of the "
-                                         "pointer ones. They need contiguous, block-padded "
-                                         "q/k/v, so enabling this copies the inputs: peak "
-                                         "VRAM goes from ~1x (bf16) / ~2x (int8) a q/k/v "
-                                         "tensor to ~4x, plus the copy bandwidth. Off by "
-                                         "default because it has not measured faster on any "
-                                         "tested GPU. Requires SM90+ and Triton 3.3+; "
-                                         "ignored otherwise. 'verbose' logs the path used."),
+                                         "pointer ones. Descriptors address strided inputs "
+                                         "directly, so this no longer copies q/k/v and peak "
+                                         "VRAM matches the pointer path. Off by default "
+                                         "because it has not measured faster on any tested "
+                                         "GPU. Requires SM90+ and Triton 3.3+; ignored "
+                                         "otherwise. 'verbose' logs the path used."),
                 io.String.Input("dense_blocks", default="",
                                                 tooltip="Transformer blocks to keep dense, e.g. '0-2,-1' "
                                                         "for the first three and the last. Negative "
@@ -396,7 +453,8 @@ class SolAttnPatch(io.ComfyNode):
     @classmethod
     def execute(cls, model, tau, start_percent, end_percent,
                 min_tokens, int8_qk, sink_conditioning, morton,
-                morton_curve, dense_blocks, verbose, use_tma=False) -> io.NodeOutput:
+                morton_curve, dense_blocks, verbose,
+                use_tma=False, int8_pv=True) -> io.NodeOutput:
         if _sol_attn_kernel is None:
             raise RuntimeError(f"Sol-Attn kernel unavailable: {_IMPORT_ERROR}")
         if int8_qk and _sol_attn_int8_kernel is None:
@@ -478,12 +536,53 @@ class SolAttnPatch(io.ComfyNode):
                           sigma_start=sigma_start, sigma_end=sigma_end,
                           verbose=verbose, int8_qk=int8_qk,
                           sink_conditioning=sink_conditioning,
-                          use_tma=use_tma, dense_blocks=dense, previous=previous)
+                          use_tma=use_tma, dense_blocks=dense,
+                          int8_pv=int8_pv, previous=previous)
         if reorder:
             m.model_options["transformer_options"]["sol_morton"] = True
             m.model_options["transformer_options"]["sol_morton_curve"] = morton_curve
         _set_autotune_verbose(verbose)
         reset_sol_attn_stats()
+        return io.NodeOutput(m)
+
+
+class SolAttnBlockProbe(io.ComfyNode):
+    @classmethod
+    def define_schema(cls):
+        return io.Schema(
+            node_id="SolAttnBlockProbe",
+            display_name="Sol-Attn Block Probe",
+            is_experimental=True,
+            category="sol_attn",
+            description="Diagnostic. Place after Patch Sol-Attn: every attention call is "
+                        "computed both sparse and dense, and each block's relative error "
+                        "is logged worst-first when sampling ends. Paste the top entries "
+                        "into the patch node's dense_blocks. The image this produces is "
+                        "the dense reference, and the run costs roughly dense + sparse, "
+                        "so remove the node once you have the numbers.",
+            inputs=[io.Model.Input("model")],
+            outputs=[io.Model.Output()],
+        )
+
+    @classmethod
+    def execute(cls, model) -> io.NodeOutput:
+        m = model.clone()
+        inner = m.model_options["transformer_options"].get("optimized_attention_override")
+        if inner is None:
+            raise RuntimeError(
+                "Sol-Attn Block Probe needs an attention override to measure; "
+                "connect it after Patch Sol-Attn.")
+
+        diffusion_model = m.get_model_object("diffusion_model")
+        if not _install_block_index(diffusion_model):
+            logging.warning(
+                f"[sol_attn] probe: {type(diffusion_model).__name__} has no .blocks "
+                "list, so every error lands under block 'None'")
+
+        m.model_options["transformer_options"]["optimized_attention_override"] = \
+            make_probe_override(inner)
+        _probe.clear()
+        m.add_callback(CallbacksMP.ON_CLEANUP, log_probe_summary)
         return io.NodeOutput(m)
 
 
@@ -518,7 +617,7 @@ if os.environ.get("SOL_ATTN", "0") not in ("0", "", "false"):
 
 class SolAttnExtension(ComfyExtension):
     async def get_node_list(self):
-        return [SolAttnPatch]
+        return [SolAttnPatch, SolAttnBlockProbe]
 
 
 async def comfy_entrypoint() -> SolAttnExtension:
