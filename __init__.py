@@ -7,6 +7,7 @@ warm-up steps. ``SOL_ATTN=1`` installs a global override for CLI benchmarks.
 
 import logging
 import os
+import re
 from functools import partial
 
 import torch
@@ -38,8 +39,52 @@ except Exception as exc:
 
 HEAD_DIM = 128
 
-_stats = {"sparse": 0, "dense_fallback": 0, "outside_range": 0, "errors": 0}
+_stats = {"sparse": 0, "dense_fallback": 0, "outside_range": 0,
+          "dense_block": 0, "errors": 0}
 _seen = set()
+_BLOCK_INDEX_HOOKED = set()
+
+
+def parse_blocks(spec, count):
+    """Parse "0-3,47,-1" into absolute block indices; negatives count from the end."""
+    out = set()
+    for part in str(spec).replace(" ", "").split(","):
+        if not part:
+            continue
+        match = re.fullmatch(r"(-?\d+)(?:-(-?\d+))?", part)
+        if match is None:
+            raise ValueError(f"cannot parse block spec {part!r}; "
+                             "use indices and ranges like '0-3,47,-1'")
+        first = int(match.group(1))
+        last = first if match.group(2) is None else int(match.group(2))
+        first = first if first >= 0 else count + first
+        last = last if last >= 0 else count + last
+        if first > last:
+            first, last = last, first
+        out.update(range(max(first, 0), min(last, count - 1) + 1))
+    return frozenset(out)
+
+
+def _install_block_index(model):
+    """Publish the running block index into transformer_options."""
+    blocks = getattr(model, "blocks", None)
+    if blocks is None:
+        return False
+    if id(model) in _BLOCK_INDEX_HOOKED:
+        return True
+
+    def make_hook(index):
+        def hook(_module, _args, kwargs):
+            options = kwargs.get("transformer_options")
+            if isinstance(options, dict):
+                options["sol_block"] = index
+            return None
+        return hook
+
+    for index, block in enumerate(blocks):
+        block.register_forward_pre_hook(make_hook(index), with_kwargs=True)
+    _BLOCK_INDEX_HOOKED.add(id(model))
+    return True
 
 
 def sol_attn_stats():
@@ -156,7 +201,7 @@ def _sink_blocks(transformer_options, tokens, mode):
 def make_override(tau=1.0, min_tokens=4096,
                   sigma_start=None, sigma_end=None, verbose=False,
                   int8_qk=False, sink_conditioning="exact_kv", use_tma=False,
-                  previous=None):
+                  dense_blocks=frozenset(), previous=None):
     """Build an optimized_attention_override callable.
 
     ``previous`` chains any override already installed on the model: every path
@@ -176,6 +221,15 @@ def make_override(tau=1.0, min_tokens=4096,
         if mask is not None:
             _stats["dense_fallback"] += 1
             return dense()
+
+        # Depth gate, the counterpart of the sigma window below: the first and
+        # last blocks feed the embedding and the output head directly, so their
+        # approximation error has no downstream block to absorb it.
+        if dense_blocks:
+            block = kwargs.get("transformer_options", {}).get("sol_block")
+            if block in dense_blocks:
+                _stats["dense_block"] += 1
+                return dense()
 
         # Sampling-percentage gate, so the paper's dense warm-up steps work.
         if sigma_start is not None or sigma_end is not None:
@@ -318,6 +372,13 @@ class SolAttnPatch(io.ComfyNode):
                                        "temporal axis is not uniformly spaced (MiniMax-H3's frame "
                                        "spacing is non-uniform; try this if 3d degrades at some "
                                        "frame counts)."),
+                io.String.Input("dense_blocks", default="",
+                                tooltip="Transformer blocks to keep dense, e.g. '0-2,-1' "
+                                        "for the first three and the last. Negative "
+                                        "indices count from the end. The first and last "
+                                        "blocks are the most approximation-sensitive: "
+                                        "their error reaches the output with no later "
+                                        "block to absorb it. Empty means sparsify all."),
                 io.Boolean.Input("verbose", default=False),
                 io.Boolean.Input("use_tma", default=False,
                                  tooltip="Use the TMA descriptor kernels instead of the "
@@ -335,7 +396,7 @@ class SolAttnPatch(io.ComfyNode):
     @classmethod
     def execute(cls, model, tau, start_percent, end_percent,
                 min_tokens, int8_qk, sink_conditioning, morton,
-                morton_curve, verbose, use_tma=False) -> io.NodeOutput:
+                morton_curve, dense_blocks, verbose, use_tma=False) -> io.NodeOutput:
         if _sol_attn_kernel is None:
             raise RuntimeError(f"Sol-Attn kernel unavailable: {_IMPORT_ERROR}")
         if int8_qk and _sol_attn_int8_kernel is None:
@@ -363,6 +424,18 @@ class SolAttnPatch(io.ComfyNode):
                 f"[sol_attn] Morton reordering skipped: {type(diffusion_model).__name__} "
                 "is neither Wan-style nor MiniMax-H3. Sol-Attn itself still applies."
             )
+
+        blocks = getattr(diffusion_model, "blocks", None)
+        dense = parse_blocks(dense_blocks, len(blocks) if blocks is not None else 0)
+        if dense:
+            if _install_block_index(diffusion_model):
+                logging.info(f"[sol_attn] keeping blocks {sorted(dense)} dense "
+                             f"of {len(blocks)}")
+            else:
+                logging.warning(
+                    f"[sol_attn] dense_blocks ignored: {type(diffusion_model).__name__} "
+                    "has no .blocks list to index")
+                dense = frozenset()
 
         model_sampling = model.get_model_object("model_sampling")
         sigma_start = float(model_sampling.percent_to_sigma(start_percent))
@@ -405,7 +478,7 @@ class SolAttnPatch(io.ComfyNode):
                           sigma_start=sigma_start, sigma_end=sigma_end,
                           verbose=verbose, int8_qk=int8_qk,
                           sink_conditioning=sink_conditioning,
-                          use_tma=use_tma, previous=previous)
+                          use_tma=use_tma, dense_blocks=dense, previous=previous)
         if reorder:
             m.model_options["transformer_options"]["sol_morton"] = True
             m.model_options["transformer_options"]["sol_morton_curve"] = morton_curve
