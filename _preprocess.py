@@ -6,7 +6,7 @@ import torch
 import triton
 import triton.language as tl
 
-from ._autotune_log import lean_do_bench as _lean_do_bench, wrap as _wrap_autotune
+from ._autotune_log import AUTOTUNE_EXTRAS as _AUTOTUNE_EXTRAS, wrap as _wrap_autotune
 
 
 BLOCK_SIZE = 64
@@ -26,8 +26,7 @@ def tau_vector(tau, heads, device):
         for warps in (4, 8)
     ],
     key=["T"],
-    cache_results=True,  # persist timings across restarts, not just per process
-    do_bench=_lean_do_bench,
+    **_AUTOTUNE_EXTRAS,
 )
 @triton.jit
 def _reduce_kc_kernel(
@@ -69,8 +68,7 @@ def _reduce_kc_kernel(
         for warps in (4, 8)
     ],
     key=["T"],
-    cache_results=True,  # persist timings across restarts, not just per process
-    do_bench=_lean_do_bench,
+    **_AUTOTUNE_EXTRAS,
 )
 @triton.jit
 def _reduce_vc_kernel(
@@ -108,8 +106,7 @@ def _reduce_vc_kernel(
 @triton.autotune(
     configs=[triton.Config({}, num_warps=4, num_stages=2)],
     key=["T"],
-    cache_results=True,  # persist timings across restarts, not just per process
-    do_bench=_lean_do_bench,
+    **_AUTOTUNE_EXTRAS,
 )
 @triton.jit
 def _diag_threshold_kernel(

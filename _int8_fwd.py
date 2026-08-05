@@ -14,7 +14,7 @@ try:
 except Exception:
     TensorDescriptor = None
 
-from ._autotune_log import lean_do_bench as _lean_do_bench, wrap as _wrap_autotune
+from ._autotune_log import AUTOTUNE_EXTRAS as _AUTOTUNE_EXTRAS, wrap as _wrap_autotune
 from ._fused_prep import fused_preprocess
 from ._tri_fwd import _has_tma, _to_blocks
 
@@ -30,8 +30,7 @@ GROUP = 32
         for stages in (1, 2, 3, 4)
     ],
     key=["T"],
-    cache_results=True,  # persist timings across restarts, not just per process
-    do_bench=_lean_do_bench,
+    **_AUTOTUNE_EXTRAS,
 )
 @triton.jit
 def _forward_int8(
@@ -159,8 +158,7 @@ def _forward_int8(
         triton.Config({"BV": 64, "GROUP_SIZE": 64}, num_warps=4, num_stages=1),
     ],
     key=["T"],
-    cache_results=True,  # persist timings across restarts, not just per process
-    do_bench=_lean_do_bench,
+    **_AUTOTUNE_EXTRAS,
 )
 @triton.jit
 def _forward_int8_ptr(

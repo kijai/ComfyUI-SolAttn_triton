@@ -4,6 +4,7 @@ Each new sequence length makes every autotuned kernel benchmark its configs,
 stalling for seconds; without a log line that reads as a mysterious hang.
 """
 
+import inspect
 import logging
 import time
 
@@ -31,6 +32,25 @@ def lean_do_bench(fn, quantiles=None, **kwargs):
         return triton.testing.do_bench(fn, quantiles=quantiles, **kwargs)
     finally:
         driver.get_empty_cache_for_benchmark = original
+
+
+def _supported_autotune_kwargs():
+    """The optional autotune features this Triton actually accepts.
+
+    ``cache_results`` is recent and ``do_bench`` older; passing either to a
+    Triton that predates it raises TypeError while the module is still being
+    imported, which takes the whole node down rather than losing one feature.
+    """
+    params = inspect.signature(triton.autotune).parameters
+    extras = {}
+    if "cache_results" in params:
+        extras["cache_results"] = True       # persist timings across restarts
+    if "do_bench" in params:
+        extras["do_bench"] = lean_do_bench   # L2-sized flush buffer, not a flat 256 MB
+    return extras
+
+
+AUTOTUNE_EXTRAS = _supported_autotune_kwargs()
 
 
 def set_verbose(enabled):
