@@ -29,6 +29,9 @@ Triton kernels are compiled on first use, so the first run will be slower.
 Use `start_percent`, `end_percent`, and `tau` to balance generation quality and
 speed.
 
+AMD GPUs run through ROCm/HIP Triton. TMA is NVIDIA-only hardware, so the
+descriptor path is skipped on AMD and the pointer kernels are used instead.
+
 ## Examples
 
 ### Test output

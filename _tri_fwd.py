@@ -19,10 +19,21 @@ from ._autotune_log import AUTOTUNE_EXTRAS as _AUTOTUNE_EXTRAS, wrap as _wrap_au
 from ._preprocess import prepare
 
 _logged_no_descriptor = False
+_logged_hip = False
+
+IS_HIP = torch.version.hip is not None
 
 
 def _has_tma(device):
     # TensorDescriptor arrived in Triton 3.3; older installs run the pointer twin.
+    # ROCm reports its gfx arch through get_device_capability, which clears the
+    # SM90 test below although no AMD part has TMA.
+    if IS_HIP:
+        global _logged_hip
+        if not _logged_hip:
+            _logged_hip = True
+            logging.info("[sol_attn] ROCm has no TMA; using the pointer kernels.")
+        return False
     if torch.cuda.get_device_capability(device)[0] < 9:
         return False
     if TensorDescriptor is None:

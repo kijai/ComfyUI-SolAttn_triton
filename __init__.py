@@ -478,7 +478,8 @@ class SolAttnPatch(io.ComfyNode):
                                          "VRAM matches the pointer path. Off by default "
                                          "because it has not measured faster on any tested "
                                          "GPU. Requires SM90+ and Triton 3.3+; ignored "
-                                         "otherwise. 'verbose' logs the path used."),
+                                         "otherwise, including on AMD. "
+                                         "'verbose' logs the path used."),
                 io.String.Input("tau_profile", optional=True, force_input=True,
                                 tooltip="Per-block tau, overriding the base value. "
                                         "'blocks=tau' entries separated by ';' or newlines, "
