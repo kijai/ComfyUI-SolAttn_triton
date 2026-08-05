@@ -372,13 +372,6 @@ class SolAttnPatch(io.ComfyNode):
                                        "temporal axis is not uniformly spaced (MiniMax-H3's frame "
                                        "spacing is non-uniform; try this if 3d degrades at some "
                                        "frame counts)."),
-                io.String.Input("dense_blocks", default="",
-                                tooltip="Transformer blocks to keep dense, e.g. '0-2,-1' "
-                                        "for the first three and the last. Negative "
-                                        "indices count from the end. The first and last "
-                                        "blocks are the most approximation-sensitive: "
-                                        "their error reaches the output with no later "
-                                        "block to absorb it. Empty means sparsify all."),
                 io.Boolean.Input("verbose", default=False),
                 io.Boolean.Input("use_tma", default=False,
                                  tooltip="Use the TMA descriptor kernels instead of the "
@@ -389,6 +382,13 @@ class SolAttnPatch(io.ComfyNode):
                                          "default because it has not measured faster on any "
                                          "tested GPU. Requires SM90+ and Triton 3.3+; "
                                          "ignored otherwise. 'verbose' logs the path used."),
+                io.String.Input("dense_blocks", default="",
+                                                tooltip="Transformer blocks to keep dense, e.g. '0-2,-1' "
+                                                        "for the first three and the last. Negative "
+                                                        "indices count from the end. The first and last "
+                                                        "blocks are the most approximation-sensitive: "
+                                                        "their error reaches the output with no later "
+                                                        "block to absorb it. Empty means sparsify all."),
             ],
             outputs=[io.Model.Output()],
         )
