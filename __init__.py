@@ -20,9 +20,8 @@ from comfy.ldm.modules.attention import (
 from comfy.patcher_extension import CallbacksMP
 from comfy_api.latest import ComfyExtension, io
 
-from ._autotune_log import set_verbose as _set_autotune_verbose
-
 try:
+    from ._autotune_log import set_verbose as _set_autotune_verbose
     from ._tri_fwd import sol_attn as _sol_attn_kernel, _has_tma
     _IMPORT_ERROR = None
 except Exception as exc:  # triton / torch version issues
@@ -456,7 +455,9 @@ class SolAttnPatch(io.ComfyNode):
                 morton_curve, dense_blocks, verbose,
                 use_tma=False, int8_pv=True) -> io.NodeOutput:
         if _sol_attn_kernel is None:
-            raise RuntimeError(f"Sol-Attn kernel unavailable: {_IMPORT_ERROR}")
+            _log_once(("kernel_unavailable", str(_IMPORT_ERROR)),
+                      f"kernel unavailable; passing MODEL through unchanged: {_IMPORT_ERROR}")
+            return io.NodeOutput(model)
         if int8_qk and _sol_attn_int8_kernel is None:
             raise RuntimeError(f"Sol-Attn INT8 kernel unavailable: {_INT8_IMPORT_ERROR}")
 
