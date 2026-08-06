@@ -49,7 +49,7 @@ _BLOCK_INDEX_HOOKED = set()
 def parse_blocks(spec, count):
     """Parse "0-3,47,-1" into absolute block indices; negatives count from the end."""
     out = set()
-    for part in str(spec).replace(" ", "").split(","):
+    for part in "".join(str(spec).split()).split(","):   # tolerate any whitespace
         if not part:
             continue
         match = re.fullmatch(r"(-?\d+)(?:-(-?\d+))?", part)
@@ -64,6 +64,31 @@ def parse_blocks(spec, count):
             first, last = last, first
         out.update(range(max(first, 0), min(last, count - 1) + 1))
     return frozenset(out)
+
+
+def parse_tau_profile(spec, count):
+    """Parse "0-30=2.0; 39-42=0.9" into {block: tau}.
+
+    Entries are separated by ';' or newlines, so a multiline text node works as
+    well as a single line, and '#' starts a comment. Blocks not listed keep the
+    node's base tau; the block side takes dense_blocks syntax, so "0-2,47=1.8"
+    is valid. Later entries win where they overlap.
+    """
+    profile = {}
+    for entry in re.split(r"[;\n]", str(spec)):
+        entry = entry.split("#", 1)[0].strip()
+        if not entry:
+            continue
+        blocks, sep, value = entry.partition("=")
+        if not sep:
+            raise ValueError(f"tau_profile entry {entry!r} needs '=', e.g. '39-42=0.9'")
+        try:
+            level = float(value)
+        except ValueError:
+            raise ValueError(f"tau_profile entry {entry!r} has a non-numeric tau")
+        for block in parse_blocks(blocks, count):
+            profile[block] = level
+    return profile
 
 
 def _install_block_index(model):
@@ -231,7 +256,8 @@ def _sink_blocks(transformer_options, tokens, mode):
 def make_override(tau=1.0, min_tokens=4096,
                   sigma_start=None, sigma_end=None, verbose=False,
                   int8_qk=False, sink_conditioning="exact_kv", use_tma=False,
-                  dense_blocks=frozenset(), int8_pv=True, previous=None):
+                  dense_blocks=frozenset(), tau_profile=None, int8_pv=True,
+                  previous=None):
     """Build an optimized_attention_override callable.
 
     ``previous`` chains any override already installed on the model: every path
@@ -252,14 +278,16 @@ def make_override(tau=1.0, min_tokens=4096,
             _stats["dense_fallback"] += 1
             return dense()
 
-        # Depth gate, the counterpart of the sigma window below: the first and
-        # last blocks feed the embedding and the output head directly, so their
-        # approximation error has no downstream block to absorb it.
-        if dense_blocks:
+        # Depth gates, the counterpart of the sigma window below. Sensitivity to
+        # sparsification varies several-fold across depth, so a block can be kept
+        # dense outright or given its own tau.
+        block = None
+        if dense_blocks or tau_profile:
             block = kwargs.get("transformer_options", {}).get("sol_block")
-            if block in dense_blocks:
-                _stats["dense_block"] += 1
-                return dense()
+        if block in dense_blocks:
+            _stats["dense_block"] += 1
+            return dense()
+        block_tau = tau_profile.get(block, tau) if tau_profile else tau
 
         # Sampling-percentage gate, so the paper's dense warm-up steps work.
         if sigma_start is not None or sigma_end is not None:
@@ -280,7 +308,7 @@ def make_override(tau=1.0, min_tokens=4096,
 
         try:
             out = _run(q, k, v, heads, skip_reshape, skip_output_reshape,
-                       kwargs.get("scale", None), tau,
+                       kwargs.get("scale", None), block_tau,
                        min_tokens, verbose, int8_qk, sink, sink_q, use_tma,
                        int8_pv)
         except Exception as exc:
@@ -328,11 +356,13 @@ def _compose_module_patch(module, patched_forward):
             options = next((a for a in args if isinstance(a, dict) and "sol_compose" in a), {})
         gate = options.get("sol_compose")
         x = args[0] if args else None
-        take = gate is not None and torch.is_tensor(x) and x.device.type == "cuda" \
-            and x.dtype == torch.bfloat16 and x.ndim in (2, 3)
+        # KJNodes' low-VRAM block patch hands x over in a single-item list.
+        tensor = x[0] if isinstance(x, list) and len(x) == 1 and torch.is_tensor(x[0]) else x
+        take = gate is not None and torch.is_tensor(tensor) and tensor.device.type == "cuda" \
+            and tensor.dtype == torch.bfloat16 and tensor.ndim in (2, 3)
         if take:
             # H3 packs tokens first (s, dim); Wan/LTX2 are batch-first.
-            tokens = x.shape[0] if x.ndim == 2 else x.shape[1]
+            tokens = tensor.shape[0] if tensor.ndim == 2 else tensor.shape[1]
             take = tokens >= gate["min_tokens"]
         if take:
             sigmas = options.get("sigmas")
@@ -340,6 +370,14 @@ def _compose_module_patch(module, patched_forward):
                 sigma = float(sigmas[0])
                 take = not (sigma > gate["sigma_start"] or sigma < gate["sigma_end"])
         if take:
+            delegate = options.get("sol_take_forward")
+            if delegate is not None:
+                # a cooperating patch's forward that reaches optimized_attention while
+                # keeping its own low-VRAM behavior; preferred over the stock forward
+                return delegate(module, *args, **kwargs)
+            if tensor is not x:
+                x.clear()  # the stock forward wants the tensor; consume the hand-off list
+                args = (tensor,) + args[1:]
             return stock(module, *args, **kwargs)
         return patched_forward(*args, **kwargs)
 
@@ -366,6 +404,8 @@ def _install_compose_hooks(model, attn_attr):
         fwd = attn.__dict__.get("forward")
         if fwd is None or getattr(fwd, "_sol_composed", False):
             return None
+        if getattr(fwd, "_uses_optimized_attention", False):
+            return None  # patch routes through optimized_attention; the override composes directly
         if getattr(fwd, "__func__", None) is type(attn).forward:
             return None  # unpatch leaves the stock forward as an instance attr
         attn.forward = _compose_module_patch(attn, fwd)
@@ -439,6 +479,16 @@ class SolAttnPatch(io.ComfyNode):
                                          "because it has not measured faster on any tested "
                                          "GPU. Requires SM90+ and Triton 3.3+; ignored "
                                          "otherwise. 'verbose' logs the path used."),
+                io.String.Input("tau_profile", optional=True, force_input=True,
+                                tooltip="Per-block tau, overriding the base value. "
+                                        "'blocks=tau' entries separated by ';' or newlines, "
+                                        "so a multiline text node works: '0-30=2.0' then "
+                                        "'39-42=0.9'. '#' starts a comment. Block "
+                                        "sensitivity varies several-fold across depth, so "
+                                        "one tau either over-serves the insensitive blocks "
+                                        "or under-serves the fragile ones — use the Block "
+                                        "Probe to find them. Leave unconnected for a single "
+                                        "tau everywhere."),
                 io.String.Input("dense_blocks", default="",
                                                 tooltip="Transformer blocks to keep dense, e.g. '0-2,-1' "
                                                         "for the first three and the last. Negative "
@@ -454,7 +504,7 @@ class SolAttnPatch(io.ComfyNode):
     def execute(cls, model, tau, start_percent, end_percent,
                 min_tokens, int8_qk, sink_conditioning, morton,
                 morton_curve, dense_blocks, verbose,
-                use_tma=False, int8_pv=True) -> io.NodeOutput:
+                tau_profile=None, use_tma=False, int8_pv=True) -> io.NodeOutput:
         if _sol_attn_kernel is None:
             raise RuntimeError(f"Sol-Attn kernel unavailable: {_IMPORT_ERROR}")
         if int8_qk and _sol_attn_int8_kernel is None:
@@ -484,16 +534,24 @@ class SolAttnPatch(io.ComfyNode):
             )
 
         blocks = getattr(diffusion_model, "blocks", None)
-        dense = parse_blocks(dense_blocks, len(blocks) if blocks is not None else 0)
+        count = len(blocks) if blocks is not None else 0
+        dense = parse_blocks(dense_blocks, count)
+        profile = parse_tau_profile(tau_profile or "", count)
+        if (dense or profile) and not _install_block_index(diffusion_model):
+            logging.warning(
+                f"[sol_attn] dense_blocks/tau_profile ignored: "
+                f"{type(diffusion_model).__name__} has no .blocks list to index")
+            dense, profile = frozenset(), {}
         if dense:
-            if _install_block_index(diffusion_model):
-                logging.info(f"[sol_attn] keeping blocks {sorted(dense)} dense "
-                             f"of {len(blocks)}")
-            else:
-                logging.warning(
-                    f"[sol_attn] dense_blocks ignored: {type(diffusion_model).__name__} "
-                    "has no .blocks list to index")
-                dense = frozenset()
+            logging.info(f"[sol_attn] keeping blocks {sorted(dense)} dense of {count}")
+        if profile:
+            levels = {}
+            for block, level in sorted(profile.items()):
+                levels.setdefault(level, []).append(block)
+            logging.info("[sol_attn] per-block tau: "
+                         + ", ".join(f"{lv} on {len(bs)} block(s)"
+                                     for lv, bs in sorted(levels.items()))
+                         + f"; base {tau} elsewhere")
 
         model_sampling = model.get_model_object("model_sampling")
         sigma_start = float(model_sampling.percent_to_sigma(start_percent))
@@ -514,6 +572,8 @@ class SolAttnPatch(io.ComfyNode):
             owner = key.rsplit(".", 2)[-2].lower()
             if "attn" not in owner or "cross" in owner or owner == "attn2":
                 continue  # Sol-Attn never takes cross-attention; leave it patched
+            if getattr(patched, "_uses_optimized_attention", False):
+                continue  # patch routes through optimized_attention; the override composes directly
             module = m.get_model_object(key[: -len(".forward")])
             m.add_object_patch(key, _compose_module_patch(module, patched))
             composed.append(key)
@@ -537,7 +597,7 @@ class SolAttnPatch(io.ComfyNode):
                           verbose=verbose, int8_qk=int8_qk,
                           sink_conditioning=sink_conditioning,
                           use_tma=use_tma, dense_blocks=dense,
-                          int8_pv=int8_pv, previous=previous)
+                          tau_profile=profile, int8_pv=int8_pv, previous=previous)
         if reorder:
             m.model_options["transformer_options"]["sol_morton"] = True
             m.model_options["transformer_options"]["sol_morton_curve"] = morton_curve
