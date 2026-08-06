@@ -33,7 +33,8 @@ def _quant_kernel(
 
     s = tl.max(tl.abs(x), axis=1) / 127.0
     s_safe = tl.where(s > 1e-8, s, 1e-8)
-    xi = tl.extra.cuda.libdevice.round(x / s_safe[:, None])
+    val_to_round = x / s_safe[:, None]
+    xi = tl.where(val_to_round >= 0, (val_to_round + 0.5).to(tl.int32).to(tl.float32), (val_to_round - 0.5).to(tl.int32).to(tl.float32))
     xi = tl.minimum(tl.maximum(xi, -127.0), 127.0).to(tl.int8)
 
     offs_out = ((batch * TP + rows[:, None]).to(tl.int64) * H + head) * D + d[None, :]
