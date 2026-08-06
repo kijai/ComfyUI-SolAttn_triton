@@ -80,7 +80,9 @@ def _quant_v_kernel(
     ).to(tl.float32)
     s = tl.load(scale_ptr + batch_head * D + d)
 
-    xi = tl.extra.cuda.libdevice.round(x / s[None, :])
+    val_to_round = x / s[None, :]
+    xi = tl.where(val_to_round >= 0, (val_to_round + 0.5).to(tl.int32).to(tl.float32),
+                  (val_to_round - 0.5).to(tl.int32).to(tl.float32))
     xi = tl.minimum(tl.maximum(xi, -127.0), 127.0).to(tl.int8)
     offs = ((batch * TP + rows[:, None]).to(tl.int64) * H + head) * D + d[None, :]
     tl.store(vi_ptr + offs, xi, mask=valid[:, None])
