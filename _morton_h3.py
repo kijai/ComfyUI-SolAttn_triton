@@ -32,17 +32,31 @@ from ._morton import morton_perm
 
 _INSTALLED = set()
 _PATCHED_LAYOUTS = set()
+BLOCK_SIZE = 64  # kernel block size; the permutation is aligned to this grid
 _DEVICE_CACHE = {}
 # id(position_ids) -> (layout, span). The layout is kept alive deliberately so
 # the id cannot be recycled underneath us; there is one entry per distinct shape.
 _SPANS = {}
 
 
-def _perm_for(grid, curve, device):
-    key = (tuple(grid), curve, str(device))
+def _perm_for(grid, curve, device, start):
+    """Morton permutation for a video span starting at absolute row ``start``.
+
+    The kernels block from absolute position 0, so a span that does not start on
+    a block boundary splits every Z-order cell across two blocks, joining
+    opposite ends of the volume. Rotating by the misalignment realigns the
+    cells; the ragged group it displaces lands in the block shared with the
+    conditioning rows, which the exact-KV sink already keeps exact.
+    """
+    pad = (-int(start)) % BLOCK_SIZE
+    key = (tuple(grid), curve, str(device), pad)
     hit = _DEVICE_CACHE.get(key)
     if hit is None:
-        hit = morton_perm(grid, device, curve)
+        perm, inverse = morton_perm(grid, device, curve)
+        if pad:
+            perm = torch.roll(perm, pad)
+            inverse = torch.argsort(perm)
+        hit = (perm, inverse)
         _DEVICE_CACHE[key] = hit
     return hit
 
@@ -174,7 +188,7 @@ def install_h3_morton(model):
             return None
 
         curve = getattr(model, "_sol_morton_curve", "3d")
-        perm, inverse = _perm_for(grid, curve, h.device)
+        perm, inverse = _perm_for(grid, curve, h.device, start)
         h = h.clone()
         h[start:stop] = h[start:stop][perm]
 

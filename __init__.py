@@ -7,6 +7,7 @@ warm-up steps. ``SOL_ATTN=1`` installs a global override for CLI benchmarks.
 
 import logging
 import os
+import re
 from functools import partial
 
 import torch
@@ -16,13 +17,17 @@ from comfy.ldm.modules.attention import (
     register_attention_function,
     wrap_attn,
 )
+from comfy.patcher_extension import CallbacksMP
 from comfy_api.latest import ComfyExtension, io
 
+from ._autotune_log import set_verbose as _set_autotune_verbose
+
 try:
-    from ._tri_fwd import sol_attn as _sol_attn_kernel
+    from ._tri_fwd import sol_attn as _sol_attn_kernel, _has_tma
     _IMPORT_ERROR = None
 except Exception as exc:  # triton / torch version issues
     _sol_attn_kernel = None
+    _has_tma = None
     _IMPORT_ERROR = exc
 
 try:
@@ -35,8 +40,105 @@ except Exception as exc:
 
 HEAD_DIM = 128
 
-_stats = {"sparse": 0, "dense_fallback": 0, "outside_range": 0, "errors": 0}
+_stats = {"sparse": 0, "dense_fallback": 0, "outside_range": 0,
+          "dense_block": 0, "errors": 0}
 _seen = set()
+_BLOCK_INDEX_HOOKED = set()
+
+
+def parse_blocks(spec, count):
+    """Parse "0-3,47,-1" into absolute block indices; negatives count from the end."""
+    out = set()
+    for part in "".join(str(spec).split()).split(","):   # tolerate any whitespace
+        if not part:
+            continue
+        match = re.fullmatch(r"(-?\d+)(?:-(-?\d+))?", part)
+        if match is None:
+            raise ValueError(f"cannot parse block spec {part!r}; "
+                             "use indices and ranges like '0-3,47,-1'")
+        first = int(match.group(1))
+        last = first if match.group(2) is None else int(match.group(2))
+        first = first if first >= 0 else count + first
+        last = last if last >= 0 else count + last
+        if first > last:
+            first, last = last, first
+        out.update(range(max(first, 0), min(last, count - 1) + 1))
+    return frozenset(out)
+
+
+def parse_tau_profile(spec, count):
+    """Parse "0-30=2.0; 39-42=0.9" into {block: tau}.
+
+    Entries are separated by ';' or newlines, so a multiline text node works as
+    well as a single line, and '#' starts a comment. Blocks not listed keep the
+    node's base tau; the block side takes dense_blocks syntax, so "0-2,47=1.8"
+    is valid. Later entries win where they overlap.
+    """
+    profile = {}
+    for entry in re.split(r"[;\n]", str(spec)):
+        entry = entry.split("#", 1)[0].strip()
+        if not entry:
+            continue
+        blocks, sep, value = entry.partition("=")
+        if not sep:
+            raise ValueError(f"tau_profile entry {entry!r} needs '=', e.g. '39-42=0.9'")
+        try:
+            level = float(value)
+        except ValueError:
+            raise ValueError(f"tau_profile entry {entry!r} has a non-numeric tau")
+        for block in parse_blocks(blocks, count):
+            profile[block] = level
+    return profile
+
+
+def _install_block_index(model):
+    """Publish the running block index into transformer_options."""
+    blocks = getattr(model, "blocks", None)
+    if blocks is None:
+        return False
+    if id(model) in _BLOCK_INDEX_HOOKED:
+        return True
+
+    def make_hook(index):
+        def hook(_module, _args, kwargs):
+            options = kwargs.get("transformer_options")
+            if isinstance(options, dict):
+                options["sol_block"] = index
+            return None
+        return hook
+
+    for index, block in enumerate(blocks):
+        block.register_forward_pre_hook(make_hook(index), with_kwargs=True)
+    _BLOCK_INDEX_HOOKED.add(id(model))
+    return True
+
+
+_probe = {}
+
+
+def _probe_record(block, sparse_out, reference):
+    """Accumulate this block's sparse-vs-dense relative error."""
+    ref = reference.float()
+    norm = ref.norm()
+    if norm > 0:
+        entry = _probe.setdefault(block, [0.0, 0])
+        entry[0] += float((sparse_out.float() - ref).norm() / norm)
+        entry[1] += 1
+
+
+def log_probe_summary(*_args, **_kwargs):
+    """Per-block sensitivity, worst first. Blocks at the top are the ones worth
+    listing in dense_blocks."""
+    if not _probe:
+        return
+    rows = sorted(((total / count, block, count)
+                   for block, (total, count) in _probe.items()), reverse=True)
+    logging.info("[sol_attn] block sensitivity to sparsification (worst first); "
+                 "put the top entries in dense_blocks:")
+    for error, block, count in rows:
+        logging.info(f"[sol_attn]   block {block:3d}  rel err {error:.4f}  "
+                     f"({count} calls)")
+    _probe.clear()
 
 
 def sol_attn_stats():
@@ -89,7 +191,7 @@ def _ineligible(q, k, mask, dim_head, min_tokens):
 
 def _run(q, k, v, heads, skip_reshape, skip_output_reshape, scale,
          tau, min_tokens, verbose, int8_qk=False, sink_blocks=(0, 0),
-         sink_q=(0, 0)):
+         sink_q=(0, 0), use_tma=False, int8_pv=True):
     """Returns the attention output, or None if this call should stay dense."""
     if skip_reshape:
         b, _, _, dim_head = q.shape          # BHND
@@ -108,16 +210,21 @@ def _run(q, k, v, heads, skip_reshape, skip_output_reshape, scale,
 
     # No contiguous() here: the kernels take strides, so H3's interleaved qkv
     # views go in without copies.
+    extra = {"int8_pv": int8_pv} if int8_qk else {}
     kernel = _sol_attn_int8_kernel if int8_qk else _sol_attn_kernel
     out = kernel(
         qs, ks, vs,
         scale=scale, tau=tau, sink_blocks=sink_blocks, sink_q=sink_q,
+        use_tma=use_tma, **extra,
     )  # BTHD
     _stats["sparse"] += 1
     if verbose:
         mode = "int8" if int8_qk else "bf16"
-        _log_once((tuple(qs.shape), "sparse", mode),
-                  f"sparse {tuple(qs.shape)} tau={tau} {mode}")
+        # The kernels also require SM90+ and a Triton with TensorDescriptor, so
+        # report the path actually taken rather than what was asked for.
+        path = "tma" if (use_tma and _has_tma(qs.device)) else "pointer"
+        _log_once((tuple(qs.shape), "sparse", mode, path),
+                  f"sparse {tuple(qs.shape)} tau={tau} {mode} {path}")
 
     if skip_output_reshape:
         return out.transpose(1, 2)           # BHND
@@ -148,7 +255,9 @@ def _sink_blocks(transformer_options, tokens, mode):
 
 def make_override(tau=1.0, min_tokens=4096,
                   sigma_start=None, sigma_end=None, verbose=False,
-                  int8_qk=False, sink_conditioning="exact_kv", previous=None):
+                  int8_qk=False, sink_conditioning="exact_kv", use_tma=False,
+                  dense_blocks=frozenset(), tau_profile=None, int8_pv=True,
+                  previous=None):
     """Build an optimized_attention_override callable.
 
     ``previous`` chains any override already installed on the model: every path
@@ -169,6 +278,17 @@ def make_override(tau=1.0, min_tokens=4096,
             _stats["dense_fallback"] += 1
             return dense()
 
+        # Depth gates, the counterpart of the sigma window below. Sensitivity to
+        # sparsification varies several-fold across depth, so a block can be kept
+        # dense outright or given its own tau.
+        block = None
+        if dense_blocks or tau_profile:
+            block = kwargs.get("transformer_options", {}).get("sol_block")
+        if block in dense_blocks:
+            _stats["dense_block"] += 1
+            return dense()
+        block_tau = tau_profile.get(block, tau) if tau_profile else tau
+
         # Sampling-percentage gate, so the paper's dense warm-up steps work.
         if sigma_start is not None or sigma_end is not None:
             sigmas = kwargs.get("transformer_options", {}).get("sigmas")
@@ -188,13 +308,36 @@ def make_override(tau=1.0, min_tokens=4096,
 
         try:
             out = _run(q, k, v, heads, skip_reshape, skip_output_reshape,
-                       kwargs.get("scale", None), tau,
-                       min_tokens, verbose, int8_qk, sink, sink_q)
+                       kwargs.get("scale", None), block_tau,
+                       min_tokens, verbose, int8_qk, sink, sink_q, use_tma,
+                       int8_pv)
         except Exception as exc:
             _stats["errors"] += 1
             _log_kernel_failure(exc)
             return dense()
         return dense() if out is None else out
+
+    return override
+
+
+def make_probe_override(inner):
+    """Wrap an installed override so every call is computed both ways.
+
+    Returns the dense result, so each block is measured against a clean input;
+    returning the sparse one would let early error compound and inflate every
+    later block's number.
+    """
+
+    def override(func, q, k, v, heads, mask=None, attn_precision=None,
+                 skip_reshape=False, skip_output_reshape=False, **kwargs):
+        common = dict(mask=mask, attn_precision=attn_precision,
+                      skip_reshape=skip_reshape,
+                      skip_output_reshape=skip_output_reshape, **kwargs)
+        sparse = inner(func, q, k, v, heads, **common)
+        reference = func(q, k, v, heads, **common)
+        _probe_record(kwargs.get("transformer_options", {}).get("sol_block"),
+                      sparse, reference)
+        return reference
 
     return override
 
@@ -213,11 +356,13 @@ def _compose_module_patch(module, patched_forward):
             options = next((a for a in args if isinstance(a, dict) and "sol_compose" in a), {})
         gate = options.get("sol_compose")
         x = args[0] if args else None
-        take = gate is not None and torch.is_tensor(x) and x.device.type == "cuda" \
-            and x.dtype == torch.bfloat16 and x.ndim in (2, 3)
+        # KJNodes' low-VRAM block patch hands x over in a single-item list.
+        tensor = x[0] if isinstance(x, list) and len(x) == 1 and torch.is_tensor(x[0]) else x
+        take = gate is not None and torch.is_tensor(tensor) and tensor.device.type == "cuda" \
+            and tensor.dtype == torch.bfloat16 and tensor.ndim in (2, 3)
         if take:
             # H3 packs tokens first (s, dim); Wan/LTX2 are batch-first.
-            tokens = x.shape[0] if x.ndim == 2 else x.shape[1]
+            tokens = tensor.shape[0] if tensor.ndim == 2 else tensor.shape[1]
             take = tokens >= gate["min_tokens"]
         if take:
             sigmas = options.get("sigmas")
@@ -225,6 +370,14 @@ def _compose_module_patch(module, patched_forward):
                 sigma = float(sigmas[0])
                 take = not (sigma > gate["sigma_start"] or sigma < gate["sigma_end"])
         if take:
+            delegate = options.get("sol_take_forward")
+            if delegate is not None:
+                # a cooperating patch's forward that reaches optimized_attention while
+                # keeping its own low-VRAM behavior; preferred over the stock forward
+                return delegate(module, *args, **kwargs)
+            if tensor is not x:
+                x.clear()  # the stock forward wants the tensor; consume the hand-off list
+                args = (tensor,) + args[1:]
             return stock(module, *args, **kwargs)
         return patched_forward(*args, **kwargs)
 
@@ -251,6 +404,8 @@ def _install_compose_hooks(model, attn_attr):
         fwd = attn.__dict__.get("forward")
         if fwd is None or getattr(fwd, "_sol_composed", False):
             return None
+        if getattr(fwd, "_uses_optimized_attention", False):
+            return None  # patch routes through optimized_attention; the override composes directly
         if getattr(fwd, "__func__", None) is type(attn).forward:
             return None  # unpatch leaves the stock forward as an instance attr
         attn.forward = _compose_module_patch(attn, fwd)
@@ -278,7 +433,7 @@ class SolAttnPatch(io.ComfyNode):
                         "only; everything else falls back to the existing attention backend.",
             inputs=[
                 io.Model.Input("model"),
-                io.Float.Input("tau", default=1.2, min=0.0, max=4.0, step=0.05,
+                io.Float.Input("tau", default=1.3, min=0.0, max=4.0, step=0.05,
                                tooltip="Threshold beta. Higher is sparser: 1.0 ~ 16% of "
                                        "blocks kept exact, 1.5 ~ 7%, 2.0 ~ 2.7%."),
                 io.Float.Input("start_percent", default=0.2, min=0.0, max=1.0, step=0.01,
@@ -286,13 +441,13 @@ class SolAttnPatch(io.ComfyNode):
                 io.Float.Input("end_percent", default=0.9, min=0.0, max=1.0, step=0.01),
                 io.Int.Input("min_tokens", default=4096, min=0, max=1 << 20, step=512,
                              tooltip="Sequences shorter than this stay dense."),
-                io.Boolean.Input("int8_qk", default=False,
+                io.Boolean.Input("int8_qk", default=True,
                                  tooltip="INT8 QK in the exact branch (Sage-style: smoothed K, "
                                          "per-token scales). Measured free in quality; helps at "
                                          "tau<=1.5, a net loss at tau>=2.0 where the quantize "
                                          "pass outweighs the shrinking exact branch."),
                 io.Combo.Input("sink_conditioning", options=["exact_kv", "exact_kv_and_rows", "off"],
-                               default="exact_kv",
+                               default="exact_kv_and_rows",
                                tooltip="MiniMax-H3 only. exact_kv: every query sees the packed "
                                        "text/audio/reference rows exactly (~3% cost). "
                                        "exact_kv_and_rows: also runs those query rows dense, making "
@@ -304,13 +459,43 @@ class SolAttnPatch(io.ComfyNode):
                                          "2-row strip, which makes routing far more accurate at a "
                                          "given density. Exactly neutral for dense attention. "
                                          "Wan and MiniMax-H3 only; logged and skipped elsewhere."),
-                io.Combo.Input("morton_curve", options=["3d", "2d_frame"], default="3d",
+                io.Combo.Input("morton_curve", options=["3d", "2d_frame"], default="2d_frame",
                                tooltip="3d interleaves t/h/w equally. 2d_frame Z-orders within "
                                        "each frame and leaves frame order alone -- use it when the "
                                        "temporal axis is not uniformly spaced (MiniMax-H3's frame "
                                        "spacing is non-uniform; try this if 3d degrades at some "
                                        "frame counts)."),
+                io.Boolean.Input("int8_pv", default=True,
+                                 tooltip="Also run the exact branch's P@V in INT8, with a "
+                                         "per-row P scale and per-channel V scale. PV and QK "
+                                         "cost the same, so this is the other half of the "
+                                         "int8 win. Only applies when int8_qk is on."),
                 io.Boolean.Input("verbose", default=False),
+                io.Boolean.Input("use_tma", default=False,
+                                 tooltip="Use the TMA descriptor kernels instead of the "
+                                         "pointer ones. Descriptors address strided inputs "
+                                         "directly, so this no longer copies q/k/v and peak "
+                                         "VRAM matches the pointer path. Off by default "
+                                         "because it has not measured faster on any tested "
+                                         "GPU. Requires SM90+ and Triton 3.3+; ignored "
+                                         "otherwise. 'verbose' logs the path used."),
+                io.String.Input("tau_profile", optional=True, force_input=True,
+                                tooltip="Per-block tau, overriding the base value. "
+                                        "'blocks=tau' entries separated by ';' or newlines, "
+                                        "so a multiline text node works: '0-30=2.0' then "
+                                        "'39-42=0.9'. '#' starts a comment. Block "
+                                        "sensitivity varies several-fold across depth, so "
+                                        "one tau either over-serves the insensitive blocks "
+                                        "or under-serves the fragile ones — use the Block "
+                                        "Probe to find them. Leave unconnected for a single "
+                                        "tau everywhere."),
+                io.String.Input("dense_blocks", default="",
+                                                tooltip="Transformer blocks to keep dense, e.g. '0-2,-1' "
+                                                        "for the first three and the last. Negative "
+                                                        "indices count from the end. The first and last "
+                                                        "blocks are the most approximation-sensitive: "
+                                                        "their error reaches the output with no later "
+                                                        "block to absorb it. Empty means sparsify all."),
             ],
             outputs=[io.Model.Output()],
         )
@@ -318,7 +503,8 @@ class SolAttnPatch(io.ComfyNode):
     @classmethod
     def execute(cls, model, tau, start_percent, end_percent,
                 min_tokens, int8_qk, sink_conditioning, morton,
-                morton_curve, verbose) -> io.NodeOutput:
+                morton_curve, dense_blocks, verbose,
+                tau_profile=None, use_tma=False, int8_pv=True) -> io.NodeOutput:
         if _sol_attn_kernel is None:
             raise RuntimeError(f"Sol-Attn kernel unavailable: {_IMPORT_ERROR}")
         if int8_qk and _sol_attn_int8_kernel is None:
@@ -347,6 +533,26 @@ class SolAttnPatch(io.ComfyNode):
                 "is neither Wan-style nor MiniMax-H3. Sol-Attn itself still applies."
             )
 
+        blocks = getattr(diffusion_model, "blocks", None)
+        count = len(blocks) if blocks is not None else 0
+        dense = parse_blocks(dense_blocks, count)
+        profile = parse_tau_profile(tau_profile or "", count)
+        if (dense or profile) and not _install_block_index(diffusion_model):
+            logging.warning(
+                f"[sol_attn] dense_blocks/tau_profile ignored: "
+                f"{type(diffusion_model).__name__} has no .blocks list to index")
+            dense, profile = frozenset(), {}
+        if dense:
+            logging.info(f"[sol_attn] keeping blocks {sorted(dense)} dense of {count}")
+        if profile:
+            levels = {}
+            for block, level in sorted(profile.items()):
+                levels.setdefault(level, []).append(block)
+            logging.info("[sol_attn] per-block tau: "
+                         + ", ".join(f"{lv} on {len(bs)} block(s)"
+                                     for lv, bs in sorted(levels.items()))
+                         + f"; base {tau} elsewhere")
+
         model_sampling = model.get_model_object("model_sampling")
         sigma_start = float(model_sampling.percent_to_sigma(start_percent))
         sigma_end = float(model_sampling.percent_to_sigma(end_percent))
@@ -366,6 +572,8 @@ class SolAttnPatch(io.ComfyNode):
             owner = key.rsplit(".", 2)[-2].lower()
             if "attn" not in owner or "cross" in owner or owner == "attn2":
                 continue  # Sol-Attn never takes cross-attention; leave it patched
+            if getattr(patched, "_uses_optimized_attention", False):
+                continue  # patch routes through optimized_attention; the override composes directly
             module = m.get_model_object(key[: -len(".forward")])
             m.add_object_patch(key, _compose_module_patch(module, patched))
             composed.append(key)
@@ -387,11 +595,54 @@ class SolAttnPatch(io.ComfyNode):
             make_override(tau=tau, min_tokens=min_tokens,
                           sigma_start=sigma_start, sigma_end=sigma_end,
                           verbose=verbose, int8_qk=int8_qk,
-                          sink_conditioning=sink_conditioning, previous=previous)
+                          sink_conditioning=sink_conditioning,
+                          use_tma=use_tma, dense_blocks=dense,
+                          tau_profile=profile, int8_pv=int8_pv, previous=previous)
         if reorder:
             m.model_options["transformer_options"]["sol_morton"] = True
             m.model_options["transformer_options"]["sol_morton_curve"] = morton_curve
+        _set_autotune_verbose(verbose)
         reset_sol_attn_stats()
+        return io.NodeOutput(m)
+
+
+class SolAttnBlockProbe(io.ComfyNode):
+    @classmethod
+    def define_schema(cls):
+        return io.Schema(
+            node_id="SolAttnBlockProbe",
+            display_name="Sol-Attn Block Probe",
+            is_experimental=True,
+            category="sol_attn",
+            description="Diagnostic. Place after Patch Sol-Attn: every attention call is "
+                        "computed both sparse and dense, and each block's relative error "
+                        "is logged worst-first when sampling ends. Paste the top entries "
+                        "into the patch node's dense_blocks. The image this produces is "
+                        "the dense reference, and the run costs roughly dense + sparse, "
+                        "so remove the node once you have the numbers.",
+            inputs=[io.Model.Input("model")],
+            outputs=[io.Model.Output()],
+        )
+
+    @classmethod
+    def execute(cls, model) -> io.NodeOutput:
+        m = model.clone()
+        inner = m.model_options["transformer_options"].get("optimized_attention_override")
+        if inner is None:
+            raise RuntimeError(
+                "Sol-Attn Block Probe needs an attention override to measure; "
+                "connect it after Patch Sol-Attn.")
+
+        diffusion_model = m.get_model_object("diffusion_model")
+        if not _install_block_index(diffusion_model):
+            logging.warning(
+                f"[sol_attn] probe: {type(diffusion_model).__name__} has no .blocks "
+                "list, so every error lands under block 'None'")
+
+        m.model_options["transformer_options"]["optimized_attention_override"] = \
+            make_probe_override(inner)
+        _probe.clear()
+        m.add_callback(CallbacksMP.ON_CLEANUP, log_probe_summary)
         return io.NodeOutput(m)
 
 
@@ -426,7 +677,7 @@ if os.environ.get("SOL_ATTN", "0") not in ("0", "", "false"):
 
 class SolAttnExtension(ComfyExtension):
     async def get_node_list(self):
-        return [SolAttnPatch]
+        return [SolAttnPatch, SolAttnBlockProbe]
 
 
 async def comfy_entrypoint() -> SolAttnExtension:

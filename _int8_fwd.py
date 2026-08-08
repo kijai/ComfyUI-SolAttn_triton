@@ -11,27 +11,16 @@ import triton
 import triton.language as tl
 try:
     from triton.tools.tensor_descriptor import TensorDescriptor
-except ModuleNotFoundError:
+except Exception:
     TensorDescriptor = None
 
+from ._autotune_log import AUTOTUNE_EXTRAS as _AUTOTUNE_EXTRAS, wrap as _wrap_autotune
 from ._fused_prep import fused_preprocess
-from ._tri_fwd import _has_tma, _is_gfx1151
+from ._tri_fwd import _has_tma, _to_blocks
 
 
 BLOCK = 64
 GROUP = 32
-
-
-def _pad_to_blocks(q, k, v, block):
-    """Pad tokens to whole blocks for the TMA path's unmasked descriptor I/O."""
-    tokens = q.shape[1]
-    blocks = (tokens + block - 1) // block
-    padded = blocks * block
-    if padded == tokens:
-        return q, k, v, tokens, padded
-    pad = (0, 0, 0, 0, 0, padded - tokens)
-    return (torch.nn.functional.pad(q, pad), torch.nn.functional.pad(k, pad),
-            torch.nn.functional.pad(v, pad), tokens, padded)
 
 
 @triton.autotune(
@@ -41,11 +30,12 @@ def _pad_to_blocks(q, k, v, block):
         for stages in (1, 2, 3, 4)
     ],
     key=["T"],
+    **_AUTOTUNE_EXTRAS,
 )
 @triton.jit
 def _forward_int8(
-    q_desc, v_desc, kc_desc, vc_desc, o_desc,
-    qi_ptr, qs_ptr, ki_ptr, ks_ptr,
+    q_desc, kc_desc, vc_desc, o_desc,
+    qi_ptr, qs_ptr, ki_ptr, ks_ptr, vi_ptr, vsc_ptr, v_ptr,
     threshold,
     scale,
     sink_start,
@@ -54,12 +44,14 @@ def _forward_int8(
     sink_q_end,
     T,
     TP,  # padded token count: the batch stride of qi/qs/ki/ks (T is only the mask bound)
+    sv_b, sv_t, sv_h,  # bf16 V strides, read only when INT8_PV is off
     H: tl.constexpr,
     D: tl.constexpr,
     NT: tl.constexpr,
     BV: tl.constexpr,
     BLOCK_SIZE: tl.constexpr,
     GROUP_SIZE: tl.constexpr,
+    INT8_PV: tl.constexpr,
 ):
     v_tile, q_block, batch_head = (
         tl.program_id(0),
@@ -70,16 +62,19 @@ def _forward_int8(
     group_offsets = tl.max_contiguous(tl.arange(0, GROUP_SIZE), GROUP_SIZE)
     token_offsets = tl.max_contiguous(tl.arange(0, BLOCK_SIZE), BLOCK_SIZE)
     d_offsets = tl.arange(0, D)
+    bv_offsets = v_tile * BV + tl.arange(0, BV)
     q_start = q_block * BLOCK_SIZE
 
     q = q_desc.load([batch, q_start, head, 0]).reshape([BLOCK_SIZE, D])
     q_len = tl.minimum(BLOCK_SIZE, T - q_start).to(tl.float32)
+    if INT8_PV:
+        v_scale = tl.load(vsc_ptr + batch_head * D + bv_offsets)
 
     # INT8 query tile + per-token scales, staged once for the whole program.
     q_rows = q_start + token_offsets
     q_valid = q_rows < T
     qi = tl.load(
-        qi_ptr + ((batch * TP + q_rows[:, None]) * H + head) * D + d_offsets[None, :],
+        qi_ptr + ((batch * TP + q_rows[:, None]).to(tl.int64) * H + head) * D + d_offsets[None, :],
         mask=q_valid[:, None],
         other=0,
     )
@@ -134,7 +129,7 @@ def _forward_int8(
             k_valid = k_rows < T
 
             ki = tl.load(
-                ki_ptr + ((batch * TP + k_rows[:, None]) * H + head) * D + d_offsets[None, :],
+                ki_ptr + ((batch * TP + k_rows[:, None]).to(tl.int64) * H + head) * D + d_offsets[None, :],
                 mask=k_valid[:, None],
                 other=0,
             )
@@ -144,12 +139,34 @@ def _forward_int8(
             exact_scores = acc.to(tl.float32) * (qs[:, None] * ks[None, :]) * scale_log2
             exact_scores += tl.where(k_valid[None, :], 0.0, -float("inf"))
 
-            new_max = tl.maximum(row_max, tl.max(exact_scores, axis=1))
+            block_max = tl.max(exact_scores, axis=1)
+            new_max = tl.maximum(row_max, block_max)
             alpha = tl.math.exp2(row_max - new_max)
             exact_probability = tl.math.exp2(exact_scores - new_max[:, None])
             row_sum = row_sum * alpha + tl.sum(exact_probability, axis=1)
-            v = v_desc.load([batch, kv_start, head, v_tile * BV]).reshape([BLOCK_SIZE, BV])
-            output = output * alpha[:, None] + tl.dot(exact_probability.to(v.dtype), v)
+
+            if INT8_PV:
+                # P is non-negative with a known per-row max, so its scale and
+                # V's per-channel scale both factor out of the int32 dot.
+                vi = tl.load(
+                    vi_ptr + ((batch * TP + k_rows[:, None]).to(tl.int64) * H + head) * D
+                    + bv_offsets[None, :],
+                    mask=k_valid[:, None],
+                    other=0,
+                )
+                p_scale = tl.maximum(tl.math.exp2(block_max - new_max), 1e-30) / 127.0
+                pi = tl.minimum(exact_probability / p_scale[:, None] + 0.5, 127.0).to(tl.int8)
+                pv = tl.dot(pi, vi, out_dtype=tl.int32).to(tl.float32) * (
+                    p_scale[:, None] * v_scale[None, :])
+            else:
+                vb = tl.load(
+                    v_ptr + batch * sv_b + k_rows[:, None].to(tl.int64) * sv_t
+                    + head * sv_h + bv_offsets[None, :],
+                    mask=k_valid[:, None],
+                    other=0.0,
+                )
+                pv = tl.dot(exact_probability.to(vb.dtype), vb)
+            output = output * alpha[:, None] + pv
             row_max = new_max
 
     o_desc.store(
@@ -158,10 +175,22 @@ def _forward_int8(
     )
 
 
+@triton.autotune(
+    configs=[
+        # Kept small: every config costs seconds of compile per new T.
+        triton.Config({"BV": 128, "GROUP_SIZE": 64}, num_warps=4, num_stages=1),
+        triton.Config({"BV": 128, "GROUP_SIZE": 64}, num_warps=8, num_stages=1),
+        triton.Config({"BV": 128, "GROUP_SIZE": 64}, num_warps=4, num_stages=2),
+        triton.Config({"BV": 128, "GROUP_SIZE": 32}, num_warps=4, num_stages=1),
+        triton.Config({"BV": 64, "GROUP_SIZE": 64}, num_warps=4, num_stages=1),
+    ],
+    key=["T"],
+    **_AUTOTUNE_EXTRAS,
+)
 @triton.jit
 def _forward_int8_ptr(
-    q_ptr, v_ptr, kc_ptr, vc_ptr, o_ptr,
-    qi_ptr, qs_ptr, ki_ptr, ks_ptr,
+    q_ptr, kc_ptr, vc_ptr, o_ptr,
+    qi_ptr, qs_ptr, ki_ptr, ks_ptr, vi_ptr, vsc_ptr, v_ptr,
     threshold,
     scale,
     sink_start,
@@ -171,14 +200,15 @@ def _forward_int8_ptr(
     T,
     TP,    # padded token count: batch stride of o/qi/qs/ki/ks (our allocations)
     NPAD,  # padded block count: batch stride of kc/vc
-    sq_b, sq_t, sq_h,   # q/v strides (last dim must be contiguous)
-    sv_b, sv_t, sv_h,
+    sq_b, sq_t, sq_h,   # q strides (last dim must be contiguous)
+    sv_b, sv_t, sv_h,   # bf16 V strides, read only when INT8_PV is off
     H: tl.constexpr,
     D: tl.constexpr,
     NT: tl.constexpr,
     BV: tl.constexpr,
     BLOCK_SIZE: tl.constexpr,
     GROUP_SIZE: tl.constexpr,
+    INT8_PV: tl.constexpr,
 ):
     # Same math as _forward_int8. q/v/o mask their ragged token tails; kc/vc
     # are GROUP-padded allocations and load unmasked.
@@ -196,18 +226,20 @@ def _forward_int8_ptr(
 
     q_rows_ok = q_start + token_offsets < TP
     q = tl.load(
-        q_ptr + batch * sq_b + (q_start + token_offsets[:, None]) * sq_t
+        q_ptr + batch * sq_b + (q_start + token_offsets[:, None]).to(tl.int64) * sq_t
         + head * sq_h + d_offsets[None, :],
         mask=q_rows_ok[:, None],
         other=0.0,
     )
     q_len = tl.minimum(BLOCK_SIZE, T - q_start).to(tl.float32)
+    if INT8_PV:
+        v_scale = tl.load(vsc_ptr + batch_head * D + bv_offsets)
 
     # INT8 query tile + per-token scales, staged once for the whole program.
     q_rows = q_start + token_offsets
     q_valid = q_rows < T
     qi = tl.load(
-        qi_ptr + ((batch * TP + q_rows[:, None]) * H + head) * D + d_offsets[None, :],
+        qi_ptr + ((batch * TP + q_rows[:, None]).to(tl.int64) * H + head) * D + d_offsets[None, :],
         mask=q_valid[:, None],
         other=0,
     )
@@ -268,7 +300,7 @@ def _forward_int8_ptr(
             k_valid = k_rows < T
 
             ki = tl.load(
-                ki_ptr + ((batch * TP + k_rows[:, None]) * H + head) * D + d_offsets[None, :],
+                ki_ptr + ((batch * TP + k_rows[:, None]).to(tl.int64) * H + head) * D + d_offsets[None, :],
                 mask=k_valid[:, None],
                 other=0,
             )
@@ -278,51 +310,61 @@ def _forward_int8_ptr(
             exact_scores = acc.to(tl.float32) * (qs[:, None] * ks[None, :]) * scale_log2
             exact_scores += tl.where(k_valid[None, :], 0.0, -float("inf"))
 
-            new_max = tl.maximum(row_max, tl.max(exact_scores, axis=1))
+            block_max = tl.max(exact_scores, axis=1)
+            new_max = tl.maximum(row_max, block_max)
             alpha = tl.math.exp2(row_max - new_max)
             exact_probability = tl.math.exp2(exact_scores - new_max[:, None])
             row_sum = row_sum * alpha + tl.sum(exact_probability, axis=1)
-            v = tl.load(
-                v_ptr + batch * sv_b + (kv_start + token_offsets[:, None]) * sv_t
-                + head * sv_h + bv_offsets[None, :],
-                mask=k_valid[:, None],
-                other=0.0,
-            )
-            output = output * alpha[:, None] + tl.dot(exact_probability.to(v.dtype), v)
+
+            if INT8_PV:
+                # see _forward_int8 for why both scales factor out of the dot
+                vi = tl.load(
+                    vi_ptr + ((batch * TP + k_rows[:, None]).to(tl.int64) * H + head) * D
+                    + bv_offsets[None, :],
+                    mask=k_valid[:, None],
+                    other=0,
+                )
+                p_scale = tl.maximum(tl.math.exp2(block_max - new_max), 1e-30) / 127.0
+                pi = tl.minimum(exact_probability / p_scale[:, None] + 0.5, 127.0).to(tl.int8)
+                pv = tl.dot(pi, vi, out_dtype=tl.int32).to(tl.float32) * (
+                    p_scale[:, None] * v_scale[None, :])
+            else:
+                vb = tl.load(
+                    v_ptr + batch * sv_b + k_rows[:, None].to(tl.int64) * sv_t
+                    + head * sv_h + bv_offsets[None, :],
+                    mask=k_valid[:, None],
+                    other=0.0,
+                )
+                pv = tl.dot(exact_probability.to(vb.dtype), vb)
+            output = output * alpha[:, None] + pv
             row_max = new_max
 
     tl.store(
-        o_ptr + ((batch * TP + q_start + token_offsets[:, None]) * H + head) * D
+        o_ptr + ((batch * TP + q_start + token_offsets[:, None]).to(tl.int64) * H + head) * D
         + bv_offsets[None, :],
         (output / row_sum[:, None]).to(tl.bfloat16),
         mask=q_rows_ok[:, None],
     )
 
 
-_forward_int8_ptr_autotuned = triton.autotune(
-    configs=[
-        # Kept small: every config costs seconds of compile per new T.
-        triton.Config({"BV": 128, "GROUP_SIZE": 64}, num_warps=4, num_stages=1),
-        triton.Config({"BV": 128, "GROUP_SIZE": 64}, num_warps=8, num_stages=1),
-        triton.Config({"BV": 128, "GROUP_SIZE": 64}, num_warps=4, num_stages=2),
-        triton.Config({"BV": 128, "GROUP_SIZE": 32}, num_warps=4, num_stages=1),
-        triton.Config({"BV": 64, "GROUP_SIZE": 64}, num_warps=4, num_stages=1),
-    ],
-    key=["T"],
-)(_forward_int8_ptr)
+_wrap_autotune(_forward_int8, "int8 forward (descriptor)")
+_wrap_autotune(_forward_int8_ptr, "int8 forward (pointer)")
 
 
 def sol_attn_int8(q, k, v, *, scale=None, tau=1.0, sink_blocks=(0, 0), sink_q=(0, 0),
-                  cornish_fisher=False):
+                  use_tma=False, int8_pv=True):
     """Sol-Attn with an INT8 exact branch. Same contract as the BF16 kernel."""
     scale = q.shape[-1] ** -0.5 if scale is None else float(scale)
     batch, _, heads, head_dim = q.shape
-    use_tma = _has_tma(q.device)
+    use_tma = use_tma and _has_tma(q.device)
     if use_tma:
-        q, k, v = q.contiguous(), k.contiguous(), v.contiguous()
-        q, k, v, tokens, padded = _pad_to_blocks(q, k, v, BLOCK)
-        if TensorDescriptor is None:
-            raise RuntimeError("TensorDescriptor is unavailable for the TMA path.")
+        q, tokens, padded = _to_blocks(q, BLOCK)
+        # k and v only feed the strided preprocess kernels; the forward reaches
+        # them as ki/ks and vi/vsc, so neither ever needs a descriptor.
+        if k.stride(-1) != 1:
+            k = k.contiguous()
+        if v.stride(-1) != 1:
+            v = v.contiguous()
     else:
         # Pointer kernel and quantizer take strides; skip the copies.
         if q.stride(-1) != 1 or k.stride(-1) != 1 or v.stride(-1) != 1:
@@ -330,17 +372,21 @@ def sol_attn_int8(q, k, v, *, scale=None, tau=1.0, sink_blocks=(0, 0), sink_q=(0
         tokens = padded = q.shape[1]
     blocks = triton.cdiv(tokens, BLOCK)
 
-    kc, vc, threshold, qi, qs, ki, ks = fused_preprocess(
+    kc, vc, threshold, qi, qs, ki, ks, vi, vsc = fused_preprocess(
         q, k, v, tau=tau, scale=scale, tokens=tokens,
-        cornish_fisher=cornish_fisher
+        int8_pv=int8_pv,
     )
+    del k  # the forward reaches K only as ki/ks
+    if vi is None:
+        vi = vsc = v   # unused placeholders; the INT8_PV branch drops them
 
     output = torch.empty((batch, padded, heads, head_dim),
-                         device=v.device, dtype=v.dtype)
+                         device=q.device, dtype=v.dtype)
     if not use_tma:
-        args = (
-            q, v, kc, vc, output,
-            qi, qs, ki, ks,
+        grid = lambda META: (head_dim // META["BV"], blocks, batch * heads)
+        _forward_int8_ptr[grid](
+            q, kc, vc, output,
+            qi, qs, ki, ks, vi, vsc, v,
             threshold,
             scale,
             int(sink_blocks[0]),
@@ -352,27 +398,21 @@ def sol_attn_int8(q, k, v, *, scale=None, tau=1.0, sink_blocks=(0, 0), sink_q=(0
             kc.shape[1],
             q.stride(0), q.stride(1), q.stride(2),
             v.stride(0), v.stride(1), v.stride(2),
+            H=heads,
+            D=head_dim,
+            NT=blocks,
+            BLOCK_SIZE=BLOCK,
+            INT8_PV=int8_pv,
         )
-        meta = dict(H=heads, D=head_dim, NT=blocks, BLOCK_SIZE=BLOCK)
-        if _is_gfx1151(q.device):
-            _forward_int8_ptr[(1, blocks, batch * heads)](
-                *args, **meta,
-                BV=128, GROUP_SIZE=32,
-                num_warps=4, num_stages=1,
-            )
-        else:
-            grid = lambda META: (head_dim // META["BV"], blocks, batch * heads)
-            _forward_int8_ptr_autotuned[grid](*args, **meta)
         return output[:, :tokens]
     block_shape = [1, BLOCK, 1, head_dim]
     summary_shape = [1, GROUP, 1, head_dim]
     _forward_int8[(1, blocks, batch * heads)](
         TensorDescriptor.from_tensor(q, block_shape),
-        TensorDescriptor.from_tensor(v, block_shape),
         TensorDescriptor.from_tensor(kc, summary_shape),
         TensorDescriptor.from_tensor(vc, summary_shape),
         TensorDescriptor.from_tensor(output, block_shape),
-        qi, qs, ki, ks,
+        qi, qs, ki, ks, vi, vsc, v,
         threshold,
         scale,
         int(sink_blocks[0]),
@@ -381,12 +421,14 @@ def sol_attn_int8(q, k, v, *, scale=None, tau=1.0, sink_blocks=(0, 0), sink_q=(0
         int(sink_q[1]),
         tokens,
         padded,
+        v.stride(0), v.stride(1), v.stride(2),
         heads,
         head_dim,
         blocks,
         head_dim,
         BLOCK,
         GROUP,
+        int8_pv,
     )
     return output[:, :tokens]
 
