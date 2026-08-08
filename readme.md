@@ -20,7 +20,9 @@ integrates a Triton implementation of Sol-Attn into ComfyUI.
 
 > [!NOTE]
 > This project is a work in progress. It has currently been tested on RTX 4090
-> and RTX 5090 GPUs with MiniMax H3.
+> and RTX 5090 GPUs with MiniMax H3, and on Radeon 8060S (gfx1151) with ROCm
+> 7.15 and Triton 3.7. AMD GPUs running Triton use autotuned pointer kernels;
+> TMA tensor descriptors remain NVIDIA-only.
 
 ## Usage notes
 
