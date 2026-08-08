@@ -35,7 +35,7 @@ def _reduce_kc_kernel(
     T,
     s_b, s_t, s_h,  # k strides; last dim contiguous
     H: tl.constexpr,
-    N: tl.constexpr,
+    NPAD: tl.constexpr,  # padded block count: the batch stride of kc
     D: tl.constexpr,
     BLOCK: tl.constexpr,
     TILE_D: tl.constexpr,
@@ -56,7 +56,7 @@ def _reduce_kc_kernel(
     )
     summary = tl.sum(values, axis=0) / block_len
     tl.store(
-        kc + ((batch * N + block) * H + head) * D + offsets,
+        kc + ((batch * NPAD + block) * H + head) * D + offsets,
         summary,
         mask=offsets < D,
     )
@@ -78,7 +78,7 @@ def _reduce_vc_kernel(
     T,
     s_b, s_t, s_h,
     H: tl.constexpr,
-    N: tl.constexpr,
+    NPAD: tl.constexpr,  # padded block count: the batch stride of vc
     D: tl.constexpr,
     BLOCK: tl.constexpr,
     TILE_D: tl.constexpr,
@@ -99,7 +99,7 @@ def _reduce_vc_kernel(
     )
     summary = tl.sum(values, axis=0)
     tl.store(
-        vc + ((batch * N + block) * H + head) * D + offsets,
+        vc + ((batch * NPAD + block) * H + head) * D + offsets,
         summary,
         mask=offsets < D,
     )
@@ -196,7 +196,7 @@ def _reduce_kv(
         tokens,
         k.stride(0), k.stride(1), k.stride(2),
         heads,
-        blocks,
+        blocks_padded,
         head_dim,
         BLOCK_SIZE,
         tile_d,
@@ -212,7 +212,7 @@ def _reduce_kv(
         tokens,
         v.stride(0), v.stride(1), v.stride(2),
         heads,
-        blocks,
+        blocks_padded,
         head_dim,
         BLOCK_SIZE,
         tile_d,
