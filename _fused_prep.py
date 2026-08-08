@@ -68,7 +68,11 @@ def fused_preprocess(q, k, v, *, tau, scale, tokens=None, int8_pv=True):
     T = padded if tokens is None else int(tokens)
     N = triton.cdiv(T, BLOCK_SIZE)
 
-    kc, vc = _reduce_kv(k, v, T)
+    if int8_pv:
+        kc, vc, v_absmax = _reduce_kv(k, v, T, v_absmax=True)
+    else:
+        kc, vc = _reduce_kv(k, v, T)
+        v_absmax = None
 
     # Centre the pooled keys with their own mean; only valid blocks take part.
     k_mean = kc[:, :N].mean(dim=1, dtype=torch.float32)            # [B,H,D]
@@ -78,7 +82,8 @@ def fused_preprocess(q, k, v, *, tau, scale, tokens=None, int8_pv=True):
 
     # k may be shorter than q here
     ki, ks = quantize_bthd(k, mean=k_mean.reshape(B * H, D).contiguous(), out_rows=padded)
-    vi, vsc = (quantize_v_per_channel(v, out_rows=padded) if int8_pv else (None, None))
+    vi, vsc = (quantize_v_per_channel(v, out_rows=padded, absmax=v_absmax)
+               if int8_pv else (None, None))
 
     # Quantize Q and compute thresholds from one load.
     qi = torch.empty((B, padded, H, D), device=q.device, dtype=torch.int8)

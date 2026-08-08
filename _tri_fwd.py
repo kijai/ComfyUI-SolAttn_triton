@@ -15,7 +15,11 @@ try:
 except Exception:
     TensorDescriptor = None
 
-from ._autotune_log import AUTOTUNE_EXTRAS as _AUTOTUNE_EXTRAS, wrap as _wrap_autotune
+from ._autotune_log import (
+    AUTOTUNE_EXTRAS as _AUTOTUNE_EXTRAS,
+    BV_SAFE_AUTOTUNE as _BV_SAFE_AUTOTUNE,
+    wrap as _wrap_autotune,
+)
 from ._preprocess import prepare
 
 _logged_no_descriptor = False
@@ -205,7 +209,7 @@ def _forward(
         triton.Config({"BV": 64, "GROUP_SIZE": 64}, num_warps=4, num_stages=1),
     ],
     key=["T"],
-    **_AUTOTUNE_EXTRAS,
+    **_BV_SAFE_AUTOTUNE,
 )
 @triton.jit
 def _forward_ptr(

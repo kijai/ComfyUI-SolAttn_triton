@@ -14,7 +14,11 @@ try:
 except Exception:
     TensorDescriptor = None
 
-from ._autotune_log import AUTOTUNE_EXTRAS as _AUTOTUNE_EXTRAS, wrap as _wrap_autotune
+from ._autotune_log import (
+    AUTOTUNE_EXTRAS as _AUTOTUNE_EXTRAS,
+    BV_SAFE_AUTOTUNE as _BV_SAFE_AUTOTUNE,
+    wrap as _wrap_autotune,
+)
 from ._fused_prep import fused_preprocess
 from ._tri_fwd import _has_tma, _to_blocks
 
@@ -84,6 +88,8 @@ def _forward_int8(
     row_sum = tl.zeros((BLOCK_SIZE,), dtype=tl.float32)
     row_max = tl.full((BLOCK_SIZE,), -float("inf"), tl.float32)
     scale_log2 = scale * 1.4426950408889634
+    # Folded once here so the exact branch does not redo it per routed block.
+    qs_log2 = qs * scale_log2
     tail_length = T - (NT - 1) * BLOCK_SIZE
     route_threshold = tl.load(threshold + (batch * NT + q_block) * H + head)
     q_in_sink = (q_block >= sink_q_start) & (q_block < sink_q_end)
@@ -136,28 +142,32 @@ def _forward_int8(
             ks = tl.load(ks_ptr + (batch * TP + k_rows) * H + head, mask=k_valid, other=0.0)
 
             acc = tl.dot(qi, ki.T, out_dtype=tl.int32)
-            exact_scores = acc.to(tl.float32) * (qs[:, None] * ks[None, :]) * scale_log2
+            exact_scores = acc.to(tl.float32) * (qs_log2[:, None] * ks[None, :])
             exact_scores += tl.where(k_valid[None, :], 0.0, -float("inf"))
 
             block_max = tl.max(exact_scores, axis=1)
             new_max = tl.maximum(row_max, block_max)
             alpha = tl.math.exp2(row_max - new_max)
-            exact_probability = tl.math.exp2(exact_scores - new_max[:, None])
-            row_sum = row_sum * alpha + tl.sum(exact_probability, axis=1)
 
             if INT8_PV:
                 # P is non-negative with a known per-row max, so its scale and
                 # V's per-channel scale both factor out of the int32 dot.
+                # Exponentiating against the block max instead of the running max
+                # lands P in [0, 1], which is exactly the range the INT8
+                # quantization wants -- so the softmax rescale and the quant scale
+                # are the same constant and P is never materialized twice.
                 vi = tl.load(
                     vi_ptr + ((batch * TP + k_rows[:, None]).to(tl.int64) * H + head) * D
                     + bv_offsets[None, :],
                     mask=k_valid[:, None],
                     other=0,
                 )
-                p_scale = tl.maximum(tl.math.exp2(block_max - new_max), 1e-30) / 127.0
-                pi = tl.minimum(exact_probability / p_scale[:, None] + 0.5, 127.0).to(tl.int8)
+                pe = tl.math.exp2(exact_scores - block_max[:, None])
+                beta = tl.math.exp2(block_max - new_max)
+                row_sum = row_sum * alpha + beta * tl.sum(pe, axis=1)
+                pi = tl.minimum(pe * 127.0 + 0.5, 127.0).to(tl.int8)
                 pv = tl.dot(pi, vi, out_dtype=tl.int32).to(tl.float32) * (
-                    p_scale[:, None] * v_scale[None, :])
+                    (beta * (1.0 / 127.0))[:, None] * v_scale[None, :])
             else:
                 vb = tl.load(
                     v_ptr + batch * sv_b + k_rows[:, None].to(tl.int64) * sv_t
@@ -165,6 +175,8 @@ def _forward_int8(
                     mask=k_valid[:, None],
                     other=0.0,
                 )
+                exact_probability = tl.math.exp2(exact_scores - new_max[:, None])
+                row_sum = row_sum * alpha + tl.sum(exact_probability, axis=1)
                 pv = tl.dot(exact_probability.to(vb.dtype), vb)
             output = output * alpha[:, None] + pv
             row_max = new_max
@@ -178,14 +190,19 @@ def _forward_int8(
 @triton.autotune(
     configs=[
         # Kept small: every config costs seconds of compile per new T.
+        # The kernel sits at the 255-register ceiling, so num_warps=8 (which
+        # relieves registers but starves a 64-row tile of MMA work) and BV=64
+        # (which reruns the QK dot per V tile) lose badly at D=128; they are kept
+        # only because D=64 heads and other archs need them.
         triton.Config({"BV": 128, "GROUP_SIZE": 64}, num_warps=4, num_stages=1),
         triton.Config({"BV": 128, "GROUP_SIZE": 64}, num_warps=8, num_stages=1),
         triton.Config({"BV": 128, "GROUP_SIZE": 64}, num_warps=4, num_stages=2),
         triton.Config({"BV": 128, "GROUP_SIZE": 32}, num_warps=4, num_stages=1),
+        triton.Config({"BV": 128, "GROUP_SIZE": 32}, num_warps=4, num_stages=2),
         triton.Config({"BV": 64, "GROUP_SIZE": 64}, num_warps=4, num_stages=1),
     ],
     key=["T"],
-    **_AUTOTUNE_EXTRAS,
+    **_BV_SAFE_AUTOTUNE,
 )
 @triton.jit
 def _forward_int8_ptr(
@@ -249,6 +266,8 @@ def _forward_int8_ptr(
     row_sum = tl.zeros((BLOCK_SIZE,), dtype=tl.float32)
     row_max = tl.full((BLOCK_SIZE,), -float("inf"), tl.float32)
     scale_log2 = scale * 1.4426950408889634
+    # Folded once here so the exact branch does not redo it per routed block.
+    qs_log2 = qs * scale_log2
     tail_length = T - (NT - 1) * BLOCK_SIZE
     route_threshold = tl.load(threshold + (batch * NT + q_block) * H + head)
     q_in_sink = (q_block >= sink_q_start) & (q_block < sink_q_end)
@@ -307,27 +326,31 @@ def _forward_int8_ptr(
             ks = tl.load(ks_ptr + (batch * TP + k_rows) * H + head, mask=k_valid, other=0.0)
 
             acc = tl.dot(qi, ki.T, out_dtype=tl.int32)
-            exact_scores = acc.to(tl.float32) * (qs[:, None] * ks[None, :]) * scale_log2
+            exact_scores = acc.to(tl.float32) * (qs_log2[:, None] * ks[None, :])
             exact_scores += tl.where(k_valid[None, :], 0.0, -float("inf"))
 
             block_max = tl.max(exact_scores, axis=1)
             new_max = tl.maximum(row_max, block_max)
             alpha = tl.math.exp2(row_max - new_max)
-            exact_probability = tl.math.exp2(exact_scores - new_max[:, None])
-            row_sum = row_sum * alpha + tl.sum(exact_probability, axis=1)
 
             if INT8_PV:
-                # see _forward_int8 for why both scales factor out of the dot
+                # see _forward_int8 for why both scales factor out of the dot.
+                # Exponentiating against the block max instead of the running max
+                # lands P in [0, 1], which is exactly what the INT8 quantization
+                # wants -- so the softmax rescale and the quant scale are the same
+                # constant, and P never has to be materialized at running-max scale.
                 vi = tl.load(
                     vi_ptr + ((batch * TP + k_rows[:, None]).to(tl.int64) * H + head) * D
                     + bv_offsets[None, :],
                     mask=k_valid[:, None],
                     other=0,
                 )
-                p_scale = tl.maximum(tl.math.exp2(block_max - new_max), 1e-30) / 127.0
-                pi = tl.minimum(exact_probability / p_scale[:, None] + 0.5, 127.0).to(tl.int8)
+                pe = tl.math.exp2(exact_scores - block_max[:, None])
+                beta = tl.math.exp2(block_max - new_max)
+                row_sum = row_sum * alpha + beta * tl.sum(pe, axis=1)
+                pi = tl.minimum(pe * 127.0 + 0.5, 127.0).to(tl.int8)
                 pv = tl.dot(pi, vi, out_dtype=tl.int32).to(tl.float32) * (
-                    p_scale[:, None] * v_scale[None, :])
+                    (beta * (1.0 / 127.0))[:, None] * v_scale[None, :])
             else:
                 vb = tl.load(
                     v_ptr + batch * sv_b + k_rows[:, None].to(tl.int64) * sv_t
@@ -335,6 +358,8 @@ def _forward_int8_ptr(
                     mask=k_valid[:, None],
                     other=0.0,
                 )
+                exact_probability = tl.math.exp2(exact_scores - new_max[:, None])
+                row_sum = row_sum * alpha + tl.sum(exact_probability, axis=1)
                 pv = tl.dot(exact_probability.to(vb.dtype), vb)
             output = output * alpha[:, None] + pv
             row_max = new_max

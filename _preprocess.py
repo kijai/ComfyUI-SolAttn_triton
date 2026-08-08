@@ -74,6 +74,7 @@ def _reduce_kc_kernel(
 def _reduce_vc_kernel(
     v_ptr,
     vc,
+    vamax,
     T,
     s_b, s_t, s_h,
     H: tl.constexpr,
@@ -81,6 +82,7 @@ def _reduce_vc_kernel(
     D: tl.constexpr,
     BLOCK: tl.constexpr,
     TILE_D: tl.constexpr,
+    WRITE_AMAX: tl.constexpr,
 ):
     d_tile, block, batch_head = (
         tl.program_id(0),
@@ -101,6 +103,14 @@ def _reduce_vc_kernel(
         summary,
         mask=offsets < D,
     )
+    if WRITE_AMAX:
+        # Per-block half of the per-channel |V| max, from the load this kernel
+        # already does. Masked rows read 0.0, which can never raise a max.
+        tl.store(
+            vamax + ((batch * N + block) * H + head) * D + offsets,
+            tl.max(tl.abs(values.to(tl.float32)), axis=0),
+            mask=offsets < D,
+        )
 
 
 @triton.autotune(
@@ -163,7 +173,11 @@ def _reduce_kv(
     k: torch.Tensor,
     v: torch.Tensor,
     tokens: int | None = None,
+    v_absmax: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor]:
+    """``v_absmax`` also returns V's per-(head, channel) |max|, computed from the
+    load this pass already does. Getting it from ``v.abs().amax()`` instead costs
+    a third full read of V plus a full-size temporary."""
     batch, padded, heads, head_dim = k.shape
     tokens = padded if tokens is None else int(tokens)
     blocks = triton.cdiv(tokens, BLOCK_SIZE)
@@ -187,9 +201,14 @@ def _reduce_kv(
         BLOCK_SIZE,
         tile_d,
     )
+    amax_partial = (
+        torch.empty((batch, blocks, heads, head_dim), device=v.device, dtype=torch.float32)
+        if v_absmax else None
+    )
     _reduce_vc_kernel[grid](
         v,
         vc,
+        amax_partial if v_absmax else vc,
         tokens,
         v.stride(0), v.stride(1), v.stride(2),
         heads,
@@ -197,7 +216,11 @@ def _reduce_kv(
         head_dim,
         BLOCK_SIZE,
         tile_d,
+        v_absmax,
     )
+    if v_absmax:
+        # [B, blocks, H, D] -> [B, H, D]; blocks is small, so torch is fine here.
+        return kc, vc, amax_partial.amax(dim=1)
     return kc, vc
 
 

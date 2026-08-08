@@ -53,6 +53,30 @@ def _supported_autotune_kwargs():
 AUTOTUNE_EXTRAS = _supported_autotune_kwargs()
 
 
+def _prune_bv_over_head_dim(configs, named_args, **kwargs):
+    """Drop configs whose BV is wider than the head dim.
+
+    The forward grid is ``head_dim // BV``, so BV > head_dim gives a zero-sized
+    grid: nothing launches, the caller gets its ``torch.empty`` output back
+    untouched, and the autotuner clocks that as the fastest config and pins it.
+    head_dim=64 heads hit this against the BV=128 configs and silently return
+    uninitialized memory.
+    """
+    head_dim = kwargs.get("D", named_args.get("D"))
+    if head_dim is None:
+        return configs
+    kept = [c for c in configs if c.kwargs.get("BV", head_dim) <= head_dim]
+    # Never hand back an empty list; fall back to the narrowest config.
+    return kept or [min(configs, key=lambda c: c.kwargs.get("BV", head_dim))]
+
+
+# Merged into the autotune kwargs of every kernel whose grid divides by BV.
+BV_SAFE_AUTOTUNE = dict(
+    AUTOTUNE_EXTRAS,
+    prune_configs_by={"early_config_prune": _prune_bv_over_head_dim},
+)
+
+
 def set_verbose(enabled):
     global _verbose
     _verbose = bool(enabled)
