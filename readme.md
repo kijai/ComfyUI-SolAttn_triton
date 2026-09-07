@@ -1,3 +1,7 @@
+# DEPRECATED
+
+ComfyUI and comfy-kitchen now includes optimized proper Sparse Attention including sol-attn built-in, this node is redundant.
+
 <h1 align="center">ComfyUI-SolAttn</h1>
 
 <h4 align="center">
