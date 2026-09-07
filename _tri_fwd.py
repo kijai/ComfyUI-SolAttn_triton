@@ -27,7 +27,7 @@ _logged_no_descriptor = False
 
 def _has_tma(device):
     # TensorDescriptor arrived in Triton 3.3; older installs run the pointer twin.
-    if torch.cuda.get_device_capability(device)[0] < 9:
+    if torch.version.hip is not None or torch.cuda.get_device_capability(device)[0] < 9:
         return False
     if TensorDescriptor is None:
         global _logged_no_descriptor
@@ -199,15 +199,22 @@ def _forward(
     )
 
 
+_FORWARD_PTR_CONFIGS = [
+    # Kept small: every config costs seconds of compile per new T.
+    triton.Config({"BV": 128, "GROUP_SIZE": 64}, num_warps=4, num_stages=1),
+    triton.Config({"BV": 128, "GROUP_SIZE": 64}, num_warps=8, num_stages=1),
+    triton.Config({"BV": 128, "GROUP_SIZE": 64}, num_warps=4, num_stages=2),
+    triton.Config({"BV": 128, "GROUP_SIZE": 32}, num_warps=4, num_stages=1),
+    triton.Config({"BV": 64, "GROUP_SIZE": 64}, num_warps=4, num_stages=1),
+]
+if torch.version.hip is not None:
+    _FORWARD_PTR_CONFIGS.append(
+        triton.Config({"BV": 64, "GROUP_SIZE": 16, "waves_per_eu": 1}, num_warps=4, num_stages=1)
+    )
+
+
 @triton.autotune(
-    configs=[
-        # Kept small: every config costs seconds of compile per new T.
-        triton.Config({"BV": 128, "GROUP_SIZE": 64}, num_warps=4, num_stages=1),
-        triton.Config({"BV": 128, "GROUP_SIZE": 64}, num_warps=8, num_stages=1),
-        triton.Config({"BV": 128, "GROUP_SIZE": 64}, num_warps=4, num_stages=2),
-        triton.Config({"BV": 128, "GROUP_SIZE": 32}, num_warps=4, num_stages=1),
-        triton.Config({"BV": 64, "GROUP_SIZE": 64}, num_warps=4, num_stages=1),
-    ],
+    configs=_FORWARD_PTR_CONFIGS,
     key=["T"],
     **_BV_SAFE_AUTOTUNE,
 )
